@@ -1,4 +1,4 @@
-use std::{env, fs::File, path::PathBuf, process, str::FromStr};
+use std::{collections::BTreeMap, env, fs::File, path::PathBuf, process, str::FromStr};
 
 use chrono::Local;
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
@@ -13,9 +13,11 @@ use solana_pubkey::Pubkey;
 use solana_signer::{EncodableKey, Signer};
 use surfpool_mcp::McpOptions;
 use surfpool_types::{
-    CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED, DEFAULT_NETWORK_HOST, DEFAULT_RPC_PORT,
-    DEFAULT_SLOT_TIME_MS, DEFAULT_WS_PORT, RpcConfig, SimnetConfig, SimnetEvent, StudioConfig,
-    SubgraphConfig, SurfpoolConfig,
+    AccountSnapshot, BlockProductionMode, CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED,
+    DEFAULT_DEVNET_RPC_URL, DEFAULT_GOSSIP_PORT, DEFAULT_MAINNET_RPC_URL, DEFAULT_NETWORK_HOST,
+    DEFAULT_RPC_PORT, DEFAULT_SLOT_TIME_MS, DEFAULT_TESTNET_RPC_URL, DEFAULT_TPU_PORT,
+    DEFAULT_TPU_QUIC_PORT, DEFAULT_WS_PORT, RpcConfig, SimnetConfig, SimnetEvent, StudioConfig,
+    SubgraphConfig, SurfpoolConfig, SvmFeature, SvmFeatureConfig,
 };
 use txtx_cloud::LoginCommand;
 use txtx_core::manifest::WorkspaceManifest;
@@ -32,9 +34,6 @@ pub struct Context {
     pub tracer: bool,
 }
 
-pub const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
-pub const DEVNET_RPC_URL: &str = "https://api.devnet.solana.com";
-pub const TESTNET_RPC_URL: &str = "https://api.testnet.solana.com";
 pub const DEFAULT_ID_SVC_URL: &str = "https://id.txtx.run/v1";
 pub const DEFAULT_CLOUD_URL: &str = "https://cloud.txtx.run";
 pub const DEFAULT_SVM_GQL_URL: &str = "https://svm-cloud.gql.txtx.run/v1/graphql";
@@ -119,7 +118,7 @@ enum Command {
     /// Run, runbook, run!
     #[clap(name = "run", bin_name = "run")]
     Run(ExecuteRunbook),
-    /// List runbooks present in the current direcoty
+    /// List runbooks present in the current directory
     #[clap(name = "ls", bin_name = "ls")]
     List(ListRunbooks),
     /// Txtx cloud commands
@@ -132,12 +131,8 @@ enum Command {
 
 #[derive(Parser, PartialEq, Clone, Debug)]
 pub struct StartSimnet {
-    /// Path to the runbook manifest, used to locate the root of the project (eg. surfpool start --manifest-file-path ./txtx.toml)
-    #[arg(
-        long = "manifest-file-path",
-        short = 'm',
-        default_value = "./Surfpool.toml"
-    )]
+    /// Path to the runbook manifest, used to locate the root of the project (eg. surfpool start --manifest-file-path ./txtx.yml)
+    #[arg(long = "manifest-file-path", short = 'm', default_value = "./txtx.yml")]
     pub manifest_path: String,
     /// Set the Simnet RPC port (eg. surfpool start --port 8080)
     #[arg(long = "port", short = 'p', default_value_t = DEFAULT_RPC_PORT)]
@@ -151,8 +146,16 @@ pub struct StartSimnet {
     /// Set the slot time (eg. surfpool start --slot-time 400)
     #[arg(long = "slot-time", short = 't', default_value_t = DEFAULT_SLOT_TIME_MS)]
     pub slot_time: u64,
+    /// Set the block production mode (eg. surfpool start --block-production-mode transaction)
+    #[arg(long = "block-production-mode", short = 'b', default_value_t = BlockProductionMode::Clock)]
+    pub block_production_mode: BlockProductionMode,
     /// Set a datasource RPC URL (cannot be used with --network). Can also be set via SURFPOOL_DATASOURCE_RPC_URL. (eg. surfpool start --rpc-url https://api.mainnet-beta.solana.com)
-    #[arg(long = "rpc-url", short = 'u', conflicts_with = "network", default_value = DEFAULT_RPC_URL)]
+    #[arg(
+        long = "rpc-url",
+        short = 'u',
+        conflicts_with = "network",
+        env = "SURFPOOL_DATASOURCE_RPC_URL"
+    )]
     pub rpc_url: Option<String>,
     /// Choose a predefined network (cannot be used with --rpc-url) (eg. surfpool start --network mainnet)
     #[arg(long = "network", short = 'n', value_enum, conflicts_with = "rpc_url")]
@@ -160,13 +163,10 @@ pub struct StartSimnet {
     /// Display streams of logs instead of terminal UI dashboard(eg. surfpool start --no-tui)
     #[clap(long = "no-tui", default_value = "false")]
     pub no_tui: bool,
-    /// Include debug logs (eg. surfpool start --debug)
-    #[clap(long = "debug", action=ArgAction::SetTrue, default_value = "false")]
-    pub debug: bool,
     /// Disable auto deployments (eg. surfpool start --no-deploy)
     #[clap(long = "no-deploy", default_value = "false")]
     pub no_deploy: bool,
-    /// List of runbooks-id to run (eg. surfpool start --runbook runbook-1 --runbook runbook-2)  
+    /// List of runbooks-id to run (eg. surfpool start --runbook runbook-1 --runbook runbook-2)
     #[arg(long = "runbook", short = 'r', default_value = DEFAULT_RUNBOOK)]
     pub runbooks: Vec<String>,
     /// Skip prompts for generating runbooks, and assume "yes" for all (eg. surfpool start -y)
@@ -202,7 +202,7 @@ pub struct StartSimnet {
     /// Disable instruction profiling (eg. surfpool start --disable-instruction-profiling)
     #[clap(long = "disable-instruction-profiling", action=ArgAction::SetTrue)]
     pub disable_instruction_profiling: bool,
-    /// The log level to use for simnet logs. Options are "trace", "debug", "info", "warn", "error". (eg. surfpool start --log-level debug)
+    /// The log level to use for simnet logs. Options are "trace", "debug", "info", "warn", "error", or "none". (eg. surfpool start --log-level debug)
     #[arg(long = "log-level", short = 'l', default_value = "info")]
     pub log_level: String,
     /// The directory to put simnet logs. (eg. surfpool start --log-path ./logs)
@@ -221,6 +221,46 @@ pub struct StartSimnet {
     /// Start surfpool with some CI adequate settings  (eg. surfpool start --ci)
     #[clap(long = "ci", action=ArgAction::SetTrue, default_value = "false")]
     pub ci: bool,
+    /// Apply suggested defaults for runbook generation and execution when running as part of an anchor test suite (eg. surfpool start --legacy-anchor-compatibility)
+    #[clap(long = "legacy-anchor-compatibility", action=ArgAction::SetTrue, default_value = "false")]
+    pub anchor_compat: bool,
+    /// Path to the Test.toml test suite files to load (eg. surfpool start --anchor-test-config-path ./path/to/Test.toml)
+    #[arg(long = "anchor-test-config-path")]
+    pub anchor_test_config_paths: Vec<String>,
+    /// Enable specific SVM features. Can be specified multiple times. (eg. surfpool start --feature enable-loader-v4 --feature enable-sbpf-v2-deployment-and-execution)
+    #[arg(long = "feature", short = 'f', value_parser = parse_svm_feature)]
+    pub features: Vec<SvmFeature>,
+    /// Disable specific SVM features. Can be specified multiple times. (eg. surfpool start --disable-feature disable-fees-sysvar)
+    #[arg(long = "disable-feature", value_parser = parse_svm_feature)]
+    pub disable_features: Vec<SvmFeature>,
+    /// Enable all SVM features (override mainnet defaults which are used by default)
+    #[clap(long = "features-all", action=ArgAction::SetTrue, default_value = "false")]
+    pub all_features: bool,
+    /// A set of inputs to use for the runbook (eg. surfpool start --runbook-input myInputs.json)
+    #[arg(long = "runbook-input", short = 'i')]
+    pub runbook_input: Vec<String>,
+    /// Surfnet database connection URL for persistent Surfnets. For an in-memory sqlite database, use ":memory:". For an on-disk sqlite database, use a filename ending in '.sqlite'.
+    #[arg(long = "db")]
+    pub db: Option<String>,
+    /// Unique identifier for this surfnet instance. Used to isolate database storage when multiple surfnets share the same database. Defaults to "default".
+    #[arg(long = "surfnet-id", default_value = "default")]
+    pub surfnet_id: String,
+    /// Path to JSON snapshot file(s) to preload accounts from. Can be specified multiple times.
+    /// (eg. surfpool start --snapshot ./snapshot1.json --snapshot ./snapshot2.json)
+    /// The snapshot format matches the output of surfnet_exportSnapshot RPC method.
+    /// Account values can be null to fetch the account from the remote RPC instead.
+    /// When multiple files are provided, later files override earlier ones for duplicate keys.
+    #[arg(long = "snapshot")]
+    pub snapshot: Vec<String>,
+}
+
+fn parse_svm_feature(s: &str) -> Result<SvmFeature, String> {
+    SvmFeature::from_str(s).map_err(|_| {
+        format!(
+            "Unknown SVM feature: '{}'. Use --help to see available features.",
+            s
+        )
+    })
 }
 
 #[derive(clap::ValueEnum, PartialEq, Clone, Debug)]
@@ -300,6 +340,9 @@ impl StartSimnet {
             },
             bind_port: self.simnet_port,
             ws_port: self.ws_port,
+            gossip_port: DEFAULT_GOSSIP_PORT,
+            tpu_port: DEFAULT_TPU_PORT,
+            tpu_quic_port: DEFAULT_TPU_QUIC_PORT,
         }
     }
 
@@ -313,20 +356,39 @@ impl StartSimnet {
         }
     }
 
-    pub fn simnet_config(&self, airdrop_addresses: Vec<Pubkey>) -> SimnetConfig {
+    pub fn feature_config(&self) -> SvmFeatureConfig {
+        let mut config = if self.all_features {
+            // Enable all SVM features (override mainnet defaults)
+            let mut cfg = SvmFeatureConfig::default();
+            for feature in SvmFeature::all() {
+                cfg = cfg.enable(feature);
+            }
+            cfg
+        } else {
+            // Use mainnet defaults by default
+            SvmFeatureConfig::default_mainnet_features()
+        };
+
+        // Apply explicit enables (these override defaults)
+        for feature in &self.features {
+            config = config.enable(*feature);
+        }
+
+        // Apply explicit disables (these override defaults)
+        for feature in &self.disable_features {
+            config = config.disable(*feature);
+        }
+
+        config
+    }
+
+    pub fn simnet_config(
+        &self,
+        airdrop_addresses: Vec<Pubkey>,
+        snapshot: BTreeMap<String, Option<AccountSnapshot>>,
+    ) -> SimnetConfig {
         let remote_rpc_url = if !self.offline {
-            Some(match &self.network {
-                Some(NetworkType::Mainnet) => DEFAULT_RPC_URL.to_string(),
-                Some(NetworkType::Devnet) => DEVNET_RPC_URL.to_string(),
-                Some(NetworkType::Testnet) => TESTNET_RPC_URL.to_string(),
-                None => match self.rpc_url {
-                    Some(ref rpc_url) => rpc_url.clone(),
-                    None => match env::var("SURFPOOL_DATASOURCE_RPC_URL") {
-                        Ok(value) => value,
-                        _ => DEFAULT_RPC_URL.to_string(),
-                    },
-                },
-            })
+            Some(self.datasource_rpc_url())
         } else {
             None
         };
@@ -334,7 +396,7 @@ impl StartSimnet {
         SimnetConfig {
             remote_rpc_url,
             slot_time: self.slot_time,
-            block_production_mode: surfpool_types::BlockProductionMode::Clock,
+            block_production_mode: self.block_production_mode.clone(),
             airdrop_addresses,
             airdrop_token_amount: self.airdrop_token_amount,
             expiry: None,
@@ -346,6 +408,22 @@ impl StartSimnet {
             } else {
                 Some(self.log_bytes_limit)
             },
+            feature_config: self.feature_config(),
+            skip_signature_verification: false,
+            surfnet_id: self.surfnet_id.clone(),
+            snapshot,
+        }
+    }
+
+    pub fn datasource_rpc_url(&self) -> String {
+        match self.network {
+            Some(NetworkType::Mainnet) => DEFAULT_MAINNET_RPC_URL.to_string(),
+            Some(NetworkType::Devnet) => DEFAULT_DEVNET_RPC_URL.to_string(),
+            Some(NetworkType::Testnet) => DEFAULT_TESTNET_RPC_URL.to_string(),
+            None => self
+                .rpc_url
+                .clone()
+                .unwrap_or_else(|| DEFAULT_MAINNET_RPC_URL.to_string()),
         }
     }
 
@@ -353,7 +431,11 @@ impl StartSimnet {
         SubgraphConfig {}
     }
 
-    pub fn surfpool_config(&self, airdrop_addresses: Vec<Pubkey>) -> SurfpoolConfig {
+    pub fn surfpool_config(
+        &self,
+        airdrop_addresses: Vec<Pubkey>,
+        snapshot: BTreeMap<String, Option<AccountSnapshot>>,
+    ) -> SurfpoolConfig {
         let plugin_config_path = self
             .plugin_config_path
             .iter()
@@ -361,7 +443,7 @@ impl StartSimnet {
             .collect::<Vec<_>>();
 
         SurfpoolConfig {
-            simnets: vec![self.simnet_config(airdrop_addresses)],
+            simnets: vec![self.simnet_config(airdrop_addresses, snapshot)],
             rpc: self.rpc_config(),
             subgraph: self.subgraph_config(),
             studio: self.studio_config(),
@@ -453,7 +535,7 @@ impl ExecuteRunbook {
             unsupervised: true,
             web_console: false,
             term_console: false,
-            output_json: Some(Some("runbook-outputs".to_string())),
+            output_json: Some(Some(".surfpool/runbook-outputs".to_string())),
             output: None,
             explain: false,
             #[cfg(feature = "supervisor_ui")]
@@ -516,6 +598,7 @@ fn handle_command(opts: Opts, ctx: &Context) -> Result<(), String> {
                 cmd.disable_instruction_profiling = true;
                 cmd.no_studio = true;
                 cmd.no_tui = true;
+                cmd.log_level = "none".to_string();
             }
 
             if cmd.daemon {
@@ -532,7 +615,9 @@ fn handle_command(opts: Opts, ctx: &Context) -> Result<(), String> {
                 }
             }
 
-            setup_logger(&cmd.log_dir, None, "simnet", &cmd.log_level, cmd.no_tui)?;
+            if !cmd.log_level.eq_ignore_ascii_case("none") {
+                setup_logger(&cmd.log_dir, None, "simnet", &cmd.log_level, cmd.no_tui)?;
+            }
 
             if cmd.daemon {
                 #[cfg(not(target_os = "windows"))]
@@ -639,13 +724,9 @@ pub fn setup_logger(
         log_location.append_path(&filename)?;
 
         if !log_location.exists() {
-            log_location.create_dir_and_file().map_err(|e| {
-                format!(
-                    "Failed to create log file {}: {}",
-                    log_location.to_string(),
-                    e
-                )
-            })?;
+            log_location
+                .create_dir_and_file()
+                .map_err(|e| format!("Failed to create log file {}: {}", log_location, e))?;
         }
         log_location
     };

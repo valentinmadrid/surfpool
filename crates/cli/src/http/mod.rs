@@ -1,6 +1,9 @@
 #![allow(unused_imports, unused_variables)]
 use std::{
-    collections::HashMap, error::Error as StdError, sync::RwLock, thread::JoinHandle,
+    collections::HashMap,
+    error::Error as StdError,
+    sync::{Arc, RwLock},
+    thread::JoinHandle,
     time::Duration,
 };
 
@@ -9,7 +12,7 @@ use actix_web::{
     App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
     dev::ServerHandle,
     http::header::{self},
-    middleware,
+    middleware, post,
     web::{self, Data, route},
 };
 use convert_case::{Case, Casing};
@@ -19,6 +22,8 @@ use juniper_graphql_ws::ConnectionConfig;
 use log::{debug, error, info, trace, warn};
 #[cfg(feature = "explorer")]
 use rust_embed::RustEmbed;
+use serde::{Deserialize, Serialize};
+use surfpool_core::scenarios::TemplateRegistry;
 use surfpool_gql::{
     DynamicSchema,
     db::schema::collections,
@@ -28,7 +33,8 @@ use surfpool_gql::{
 };
 use surfpool_studio_ui::serve_studio_static_files;
 use surfpool_types::{
-    DataIndexingCommand, SanitizedConfig, SubgraphCommand, SubgraphEvent, SurfpoolConfig,
+    DataIndexingCommand, OverrideTemplate, SanitizedConfig, Scenario, SubgraphCommand,
+    SubgraphEvent, SurfpoolConfig,
 };
 use txtx_core::kit::types::types::Value;
 use txtx_gql::kit::uuid::Uuid;
@@ -47,6 +53,7 @@ pub async fn start_subgraph_and_explorer_server(
     subgraph_events_tx: Sender<SubgraphEvent>,
     subgraph_commands_rx: Receiver<SubgraphCommand>,
     ctx: &Context,
+    enable_studio: bool,
 ) -> Result<(ServerHandle, JoinHandle<Result<(), String>>), Box<dyn StdError>> {
     let sql_store = SqlStore::new(subgraph_database_path);
     sql_store.init_subgraph_tables()?;
@@ -61,41 +68,61 @@ pub async fn start_subgraph_and_explorer_server(
     let schema_wrapped = Data::new(schema);
     let context_wrapped = Data::new(RwLock::new(context));
     let config_wrapped = Data::new(RwLock::new(config.clone()));
+    let collections_metadata_lookup_wrapped = Data::new(RwLock::new(collections_metadata_lookup));
+
+    // Initialize template registry and load templates
+    let template_registry_wrapped = Data::new(RwLock::new(TemplateRegistry::new()));
+    let loaded_scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
 
     let subgraph_handle = start_subgraph_runloop(
         subgraph_events_tx,
         subgraph_commands_rx,
         context_wrapped.clone(),
         schema_wrapped.clone(),
-        collections_metadata_lookup,
+        collections_metadata_lookup_wrapped.clone(),
         config,
         ctx,
     )?;
 
     let server = HttpServer::new(move || {
-        App::new()
+        let mut app = App::new()
             .app_data(schema_wrapped.clone())
             .app_data(context_wrapped.clone())
             .app_data(config_wrapped.clone())
+            .app_data(collections_metadata_lookup_wrapped.clone())
+            .app_data(template_registry_wrapped.clone())
+            .app_data(loaded_scenarios.clone())
             .wrap(
                 Cors::default()
                     .allow_any_origin()
-                    .allowed_methods(vec!["POST", "GET", "OPTIONS", "DELETE"])
-                    .allowed_headers(vec![header::AUTHORIZATION, header::ACCEPT])
-                    .allowed_header(header::CONTENT_TYPE)
+                    .allow_any_method()
+                    .allow_any_header()
                     .supports_credentials()
                     .max_age(3600),
             )
             .wrap(middleware::Compress::default())
             .wrap(middleware::Logger::default())
             .service(get_config)
+            .service(get_indexers)
+            .service(get_scenario_templates)
+            .service(post_scenarios)
+            .service(get_scenarios)
+            .service(delete_scenario)
+            .service(patch_scenario)
             .service(
                 web::scope("/workspace")
+                    .route("/v1/indexers", web::post().to(post_graphql))
                     .route("/v1/graphql?<request..>", web::get().to(get_graphql))
                     .route("/v1/graphql", web::post().to(post_graphql))
                     .route("/v1/subscriptions", web::get().to(subscriptions)),
-            )
-            .service(serve_studio_static_files)
+            );
+
+        if enable_studio {
+            app = app.app_data(Arc::new(RwLock::new(LoadedScenarios::new())));
+            app = app.service(serve_studio_static_files);
+        }
+
+        app
     })
     .workers(5)
     .bind(network_binding)?
@@ -139,6 +166,142 @@ async fn get_config(
         .body(api_config.to_string()))
 }
 
+#[actix_web::get("/workspace/v1/indexers")]
+async fn get_indexers(
+    collections_metadata_lookup: Data<RwLock<CollectionsMetadataLookup>>,
+) -> Result<HttpResponse, Error> {
+    let lookup = collections_metadata_lookup.read().map_err(|_| {
+        actix_web::error::ErrorInternalServerError("Failed to read collections metadata")
+    })?;
+
+    let collections: Vec<&CollectionMetadata> = lookup.entries.values().collect();
+    let response = serde_json::to_string(&collections).map_err(|_| {
+        actix_web::error::ErrorInternalServerError("Failed to serialize collections")
+    })?;
+
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(response))
+}
+
+#[actix_web::get("/v1/scenarios/templates")]
+async fn get_scenario_templates(
+    template_registry: Data<RwLock<TemplateRegistry>>,
+) -> Result<HttpResponse, Error> {
+    let registry = template_registry.read().map_err(|_| {
+        actix_web::error::ErrorInternalServerError("Failed to read template registry")
+    })?;
+
+    let templates: Vec<&OverrideTemplate> = registry.all();
+    let response = serde_json::to_string(&templates)
+        .map_err(|_| actix_web::error::ErrorInternalServerError("Failed to serialize templates"))?;
+
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(response))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LoadedScenarios {
+    pub scenarios: Vec<Scenario>,
+}
+impl LoadedScenarios {
+    pub fn new() -> Self {
+        Self {
+            scenarios: Vec::new(),
+        }
+    }
+}
+
+#[post("/v1/scenarios")]
+async fn post_scenarios(
+    req: HttpRequest,
+    scenario: web::Json<Scenario>,
+    data: Data<RwLock<LoadedScenarios>>,
+) -> Result<HttpResponse, Error> {
+    let mut loaded_scenarios = data
+        .write()
+        .map_err(|_| actix_web::error::ErrorInternalServerError("Failed to acquire write lock"))?;
+    let scenario_data = scenario.into_inner();
+    let scenario_id = scenario_data.id.clone();
+    loaded_scenarios.scenarios.push(scenario_data);
+    let response = serde_json::json!({"id": scenario_id});
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(response.to_string()))
+}
+
+#[actix_web::get("/v1/scenarios")]
+async fn get_scenarios(data: Data<RwLock<LoadedScenarios>>) -> Result<HttpResponse, Error> {
+    let loaded_scenarios = data
+        .read()
+        .map_err(|_| actix_web::error::ErrorInternalServerError("Failed to acquire read lock"))?;
+    let response = serde_json::to_string(&loaded_scenarios.scenarios).map_err(|_| {
+        actix_web::error::ErrorInternalServerError("Failed to serialize loaded scenarios")
+    })?;
+
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(response))
+}
+
+#[actix_web::delete("/v1/scenarios/{id}")]
+async fn delete_scenario(
+    path: web::Path<String>,
+    data: Data<RwLock<LoadedScenarios>>,
+) -> Result<HttpResponse, Error> {
+    let scenario_id = path.into_inner();
+    let mut loaded_scenarios = data
+        .write()
+        .map_err(|_| actix_web::error::ErrorInternalServerError("Failed to acquire write lock"))?;
+
+    let initial_len = loaded_scenarios.scenarios.len();
+    loaded_scenarios.scenarios.retain(|s| s.id != scenario_id);
+
+    if loaded_scenarios.scenarios.len() == initial_len {
+        return Ok(
+            HttpResponse::NotFound().body(format!("Scenario with id '{}' not found", scenario_id))
+        );
+    }
+
+    Ok(HttpResponse::Ok().body(format!("Scenario '{}' deleted", scenario_id)))
+}
+
+#[actix_web::patch("/v1/scenarios/{id}")]
+async fn patch_scenario(
+    path: web::Path<String>,
+    scenario: web::Json<Scenario>,
+    data: Data<RwLock<LoadedScenarios>>,
+) -> Result<HttpResponse, Error> {
+    let scenario_id = path.into_inner();
+    let mut loaded_scenarios = data
+        .write()
+        .map_err(|_| actix_web::error::ErrorInternalServerError("Failed to acquire write lock"))?;
+
+    let scenario_index = loaded_scenarios
+        .scenarios
+        .iter()
+        .position(|s| s.id == scenario_id);
+
+    match scenario_index {
+        Some(index) => {
+            loaded_scenarios.scenarios[index] = scenario.into_inner();
+            let response = serde_json::json!({"id": scenario_id});
+            Ok(HttpResponse::Ok()
+                .content_type("application/json")
+                .body(response.to_string()))
+        }
+        None => {
+            loaded_scenarios.scenarios.push(scenario.into_inner());
+            let response = serde_json::json!({"id": scenario_id});
+            Ok(HttpResponse::Ok()
+                .content_type("application/json")
+                .body(response.to_string()))
+        }
+    }
+}
+
+#[allow(dead_code)]
 #[cfg(not(feature = "explorer"))]
 fn handle_embedded_file(_path: &str) -> HttpResponse {
     HttpResponse::NotFound().body("404 Not Found")
@@ -153,6 +316,7 @@ async fn dist(path: web::Path<String>) -> impl Responder {
     handle_embedded_file(path_str)
 }
 
+#[allow(clippy::await_holding_lock)]
 async fn post_graphql(
     req: HttpRequest,
     payload: web::Payload,
@@ -173,6 +337,7 @@ async fn post_graphql(
     graphql_handler(schema, &context, req, payload).await
 }
 
+#[allow(clippy::await_holding_lock)]
 async fn get_graphql(
     req: HttpRequest,
     payload: web::Payload,
@@ -213,7 +378,7 @@ fn start_subgraph_runloop(
     subgraph_commands_rx: Receiver<SubgraphCommand>,
     gql_context: Data<RwLock<DataloaderContext>>,
     gql_schema: Data<RwLock<Option<DynamicSchema>>>,
-    mut collections_metadata_lookup: CollectionsMetadataLookup,
+    collections_metadata_lookup: Data<RwLock<CollectionsMetadataLookup>>,
     config: SanitizedConfig,
     ctx: &Context,
 ) -> Result<JoinHandle<Result<(), String>>, String> {
@@ -245,7 +410,7 @@ fn start_subgraph_runloop(
                                 })?;
 
                                 let metadata = CollectionMetadata::from_request(&uuid, &request, "surfpool");
-                                cached_metadata.insert(uuid.clone(), metadata.clone());
+                                cached_metadata.insert(uuid, metadata.clone());
 
                                 let gql_context = gql_context.write().map_err(|_| {
                                     format!(
@@ -255,14 +420,44 @@ fn start_subgraph_runloop(
                                 if let Err(e) = gql_context.pool.register_collection(&metadata, &request, &worker_id) {
                                     error!("{}", e);
                                 }
-                                collections_metadata_lookup.add_collection(metadata);
-                                gql_schema.replace(new_dynamic_schema(collections_metadata_lookup.clone()));
 
-                                let console_url = format!("{}/subgraphs", config.studio_url.clone());
+                                let mut lookup = collections_metadata_lookup.write().map_err(|_| {
+                                    format!("{err_ctx}: Failed to acquire write lock on collections metadata lookup")
+                                })?;
+                                lookup.add_collection(metadata);
+                                gql_schema.replace(new_dynamic_schema(lookup.clone()));
+
+                                let console_url = format!("{}/accounts", config.studio_url.clone());
                                 let _ = sender.send(console_url);
                             }
                             SubgraphCommand::ObserveCollection(subgraph_observer_rx) => {
                                 observers.push(subgraph_observer_rx);
+                            }
+                            SubgraphCommand::DestroyCollection(uuid) => {
+                                let err_ctx = "Failed to destroy subgraph collection";
+
+                                // Remove from cached metadata
+                                cached_metadata.remove(&uuid);
+
+                                // Unregister from database pool
+                                let gql_context = gql_context.write().map_err(|_| {
+                                    format!(
+                                        "{err_ctx}: Failed to acquire write lock on gql context"
+                                    )
+                                })?;
+                                if let Err(e) = gql_context.pool.unregister_collection(&uuid) {
+                                    error!("{}: {}", err_ctx, e);
+                                }
+
+                                // Remove from metadata lookup and update schema
+                                let mut gql_schema = gql_schema.write().map_err(|_| {
+                                    format!("{err_ctx}: Failed to acquire write lock on gql schema")
+                                })?;
+                                let mut lookup = collections_metadata_lookup.write().map_err(|_| {
+                                    format!("{err_ctx}: Failed to acquire write lock on collections metadata lookup")
+                                })?;
+                                lookup.remove_collection(&uuid);
+                                gql_schema.replace(new_dynamic_schema(lookup.clone()));
                             }
                             SubgraphCommand::Shutdown => {
                                 let _ = subgraph_events_tx.send(SubgraphEvent::Shutdown);
@@ -296,11 +491,15 @@ fn start_subgraph_runloop(
                                     }
                                 };
 
-                                let metadata = cached_metadata.get(&uuid).unwrap();
+                                // Check if metadata still exists (collection might have been destroyed)
+                                let Some(metadata) = cached_metadata.get(&uuid) else {
+                                    // Collection was destroyed, skip processing this entry
+                                    continue;
+                                };
 
                                 if let Err(e) = gql_context
                                     .pool
-                                    .insert_entries_into_collection(entries, &metadata)
+                                    .insert_entries_into_collection(entries, metadata)
                                 {
                                     let _ = subgraph_events_tx.send(SubgraphEvent::error(format!(
                                         "{err_ctx}: {e}"
@@ -311,7 +510,10 @@ fn start_subgraph_runloop(
                             DataIndexingCommand::ProcessCollection(_uuid) => {}
                         },
                         Err(_e) => {
-                            std::process::exit(1);
+                            // Observer channel closed (plugin was likely unloaded)
+                            // Remove observer in that case
+                            observers.remove(i - 1);
+                            continue;
                         }
                     },
                 }

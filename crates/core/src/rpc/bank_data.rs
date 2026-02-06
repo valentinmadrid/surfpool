@@ -13,7 +13,7 @@ use solana_epoch_schedule::EpochSchedule;
 use solana_rpc_client_api::response::Response as RpcResponse;
 
 use super::{RunloopContext, State};
-use crate::surfnet::SURFPOOL_IDENTITY_PUBKEY;
+use crate::SURFPOOL_IDENTITY_PUBKEY;
 
 #[rpc]
 pub trait BankData {
@@ -422,9 +422,14 @@ impl BankData for SurfpoolBankDataRpc {
     }
 
     fn get_inflation_rate(&self, meta: Self::Metadata) -> Result<RpcInflationRate> {
-        meta.with_svm_reader(|svm_reader| {
-            let inflation_activation_slot =
-                svm_reader.blocks.keys().min().copied().unwrap_or_default();
+        meta.with_svm_reader(|svm_reader| -> RpcInflationRate {
+            let inflation_activation_slot = svm_reader
+                .blocks
+                .keys()
+                .unwrap_or_default()
+                .into_iter()
+                .min()
+                .unwrap_or_default();
             let epoch_schedule = svm_reader.inner.get_sysvar::<EpochSchedule>();
             let inflation_start_slot = epoch_schedule.get_first_slot_in_epoch(
                 epoch_schedule
@@ -510,7 +515,7 @@ impl BankData for SurfpoolBankDataRpc {
             });
         }
 
-        Ok(vec![])
+        Ok(vec![SURFPOOL_IDENTITY_PUBKEY.to_string()])
     }
 
     fn get_block_production(
@@ -617,9 +622,10 @@ mod tests {
             .get_slot_leaders(Some(setup.context.clone()), 0, 10)
             .unwrap();
 
-        assert!(
-            result.is_empty(),
-            "Should return empty leaders in simulation"
+        assert_eq!(
+            result[0],
+            SURFPOOL_IDENTITY_PUBKEY.to_string(),
+            "Should only return one leader - itself"
         );
 
         // test with invalid limit

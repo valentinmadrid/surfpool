@@ -4,16 +4,18 @@ use std::{
 };
 
 use dialoguer::{Confirm, Input, MultiSelect, console::Style, theme::ColorfulTheme};
+use log::debug;
 use surfpool_types::{DEFAULT_NETWORK_HOST, DEFAULT_RPC_PORT};
 use txtx_addon_network_svm::templates::{
-    get_interpolated_addon_template, get_interpolated_devnet_signer_template,
-    get_interpolated_header_template, get_interpolated_localnet_signer_template,
-    get_interpolated_mainnet_signer_template,
+    AccountDirEntry, AccountEntry, GenesisEntry, get_interpolated_addon_template,
+    get_interpolated_devnet_signer_template, get_interpolated_header_template,
+    get_interpolated_localnet_signer_template, get_interpolated_mainnet_signer_template,
 };
 use txtx_core::{
     kit::{helpers::fs::FileLocation, indexmap::indexmap},
     manifest::{RunbookMetadata, WorkspaceManifest},
     templates::{TXTX_MANIFEST_TEMPLATE, build_manifest_data},
+    types::RunbookSources,
 };
 
 use crate::{cli::DEFAULT_SOLANA_KEYPAIR_PATH, types::Framework};
@@ -27,45 +29,90 @@ mod steel;
 mod typhoon;
 pub mod utils;
 
+pub struct ProgramFrameworkData {
+    pub framework: Framework,
+    pub programs: Vec<ProgramMetadata>,
+    pub genesis_accounts: Option<Vec<GenesisEntry>>,
+    pub accounts: Option<Vec<AccountEntry>>,
+    pub accounts_dir: Option<Vec<AccountDirEntry>>,
+    pub clones: Option<Vec<String>>,
+    pub generate_subgraphs: bool,
+}
+
+impl ProgramFrameworkData {
+    pub fn new(
+        framework: Framework,
+        programs: Vec<ProgramMetadata>,
+        genesis_accounts: Option<Vec<GenesisEntry>>,
+        accounts: Option<Vec<AccountEntry>>,
+        accounts_dir: Option<Vec<AccountDirEntry>>,
+        clones: Option<Vec<String>>,
+        generate_subgraphs: bool,
+    ) -> Self {
+        Self {
+            framework,
+            programs,
+            genesis_accounts,
+            accounts,
+            accounts_dir,
+            clones,
+            generate_subgraphs,
+        }
+    }
+
+    pub fn partial(framework: Framework, programs: Vec<ProgramMetadata>) -> Self {
+        Self {
+            framework,
+            programs,
+            genesis_accounts: None,
+            accounts: None,
+            accounts_dir: None,
+            clones: None,
+            generate_subgraphs: true,
+        }
+    }
+}
+
 pub async fn detect_program_frameworks(
     manifest_path: &str,
-) -> Result<Option<(Framework, Vec<ProgramMetadata>)>, String> {
+    test_paths: &[String],
+) -> Result<Option<ProgramFrameworkData>, String> {
     let manifest_location = FileLocation::from_path_string(manifest_path)?;
     let base_dir = manifest_location.get_parent_location()?;
     // Look for Anchor project layout
     // Note: Poseidon projects generate Anchor.toml files, so they will also be identified here
-    if let Some((framework, programs)) = anchor::try_get_programs_from_project(base_dir.clone())
+    if let Some(res) = anchor::try_get_programs_from_project(base_dir.clone(), test_paths)
         .map_err(|e| format!("Invalid Anchor project: {e}"))?
     {
-        return Ok(Some((framework, programs)));
+        return Ok(Some(res));
     }
 
     // Look for Steel project layout
     if let Some((framework, programs)) = steel::try_get_programs_from_project(base_dir.clone())
         .map_err(|e| format!("Invalid Steel project: {e}"))?
     {
-        return Ok(Some((framework, programs)));
+        return Ok(Some(ProgramFrameworkData::partial(framework, programs)));
     }
 
     // Look for Typhoon project layout
     if let Some((framework, programs)) = typhoon::try_get_programs_from_project(base_dir.clone())
         .map_err(|e| format!("Invalid Typhoon project: {e}"))?
     {
-        return Ok(Some((framework, programs)));
+        return Ok(Some(ProgramFrameworkData::partial(framework, programs)));
     }
 
     // Look for Pinocchio project layout
     if let Some((framework, programs)) = pinocchio::try_get_programs_from_project(base_dir.clone())
         .map_err(|e| format!("Invalid Pinocchio project: {e}"))?
     {
-        return Ok(Some((framework, programs)));
+        return Ok(Some(ProgramFrameworkData::partial(framework, programs)));
     }
 
     // Look for Native project layout
     if let Some((framework, programs)) = native::try_get_programs_from_project(base_dir.clone())
         .map_err(|e| format!("Invalid Native project: {e}"))?
     {
-        return Ok(Some((framework, programs)));
+        return Ok(Some(ProgramFrameworkData::partial(framework, programs)));
     }
 
     Ok(None)
@@ -75,22 +122,102 @@ pub async fn detect_program_frameworks(
 pub struct ProgramMetadata {
     name: String,
     idl: Option<String>,
+    so_exists: bool,
 }
 
 impl ProgramMetadata {
-    pub fn new(name: &str, idl: &Option<String>) -> Self {
+    pub fn new(name: &str, idl: &Option<String>, so_exists: bool) -> Self {
         Self {
             name: name.to_string(),
             idl: idl.clone(),
+            so_exists,
         }
     }
 }
 
+pub fn scaffold_in_memory_iac(
+    framework: &Framework,
+    programs: &[ProgramMetadata],
+    genesis_accounts: &Option<Vec<GenesisEntry>>,
+    accounts: &Option<Vec<AccountEntry>>,
+    accounts_dir: &Option<Vec<AccountDirEntry>>,
+    generate_subgraphs: bool,
+) -> Result<(String, RunbookSources, WorkspaceManifest), String> {
+    let mut deployment_runbook_src: String = String::new();
+
+    deployment_runbook_src.push_str(&get_interpolated_addon_template(
+        "input.rpc_api_url",
+        "input.network_id",
+    ));
+    deployment_runbook_src.push_str(&get_interpolated_localnet_signer_template(&format!(
+        "\"{}\"",
+        *DEFAULT_SOLANA_KEYPAIR_PATH
+    )));
+
+    for program_metadata in programs.iter() {
+        if program_metadata.so_exists {
+            deployment_runbook_src.push_str(
+                &framework
+                    .get_in_memory_interpolated_program_deployment_template(&program_metadata.name),
+            );
+
+            if generate_subgraphs {
+                if let Some(subgraph_iac) = &framework
+                    .get_interpolated_subgraph_template(
+                        &program_metadata.name,
+                        program_metadata.idl.as_ref(),
+                    )
+                    .ok()
+                    .flatten()
+                {
+                    deployment_runbook_src.push_str(subgraph_iac);
+                }
+            }
+        } else {
+            debug!(
+                "Skipping program {} deployment in in-memory IaC since the .so file was not found",
+                program_metadata.name
+            );
+        }
+    }
+
+    if let Some(setup_surfnet_iac) = framework.get_interpolated_setup_surfnet_template(
+        genesis_accounts.as_ref().unwrap_or(&vec![]),
+        accounts.as_ref().unwrap_or(&vec![]),
+        accounts_dir.as_ref().unwrap_or(&vec![]),
+    ) {
+        deployment_runbook_src.push_str(&setup_surfnet_iac);
+    }
+
+    let runbook_id = "deployment";
+    let mut manifest = WorkspaceManifest::new("memory".to_string());
+    let runbook = RunbookMetadata::new(runbook_id, runbook_id, Some("Deploy programs".to_string()));
+    manifest.runbooks.push(runbook);
+
+    manifest.environments.insert(
+        "localnet".into(),
+        indexmap! {
+            "network_id".to_string() => "localnet".to_string(),
+            "rpc_api_url".to_string() => format!("http://{}:{}", DEFAULT_NETWORK_HOST, DEFAULT_RPC_PORT),
+        },
+    );
+
+    let mut runbook_sources = RunbookSources::new();
+    runbook_sources.add_source(
+        runbook_id.to_string(),
+        FileLocation::working_dir(),
+        deployment_runbook_src,
+    );
+
+    Ok((runbook_id.into(), runbook_sources, manifest))
+}
+
 pub fn scaffold_iac_layout(
     framework: &Framework,
-    programs: Vec<ProgramMetadata>,
+    programs: &[ProgramMetadata],
     base_location: &FileLocation,
     auto_generate_runbooks: bool,
+    generate_subgraphs: bool,
 ) -> Result<(), String> {
     let mut target_location = base_location.clone();
     target_location.append_path("target")?;
@@ -107,7 +234,7 @@ pub fn scaffold_iac_layout(
     };
 
     let selected_programs = match auto_generate_runbooks {
-        true => programs.clone(),
+        true => programs,
         false => {
             let selection = MultiSelect::with_theme(&theme)
                 .with_prompt("Select the programs to deploy (all by default):")
@@ -120,7 +247,7 @@ pub fn scaffold_iac_layout(
                 .interact()
                 .map_err(|e| format!("unable to select programs to deploy: {e}"))?;
 
-            selection
+            &selection
                 .iter()
                 .map(|i| programs[*i].clone())
                 .collect::<Vec<_>>()
@@ -180,7 +307,7 @@ pub fn scaffold_iac_layout(
     // signer_simnet.push_str(&get_interpolated_addon_template("http://localhost:8899"));
     signer_localnet.push_str(&get_interpolated_localnet_signer_template(&format!(
         "\"{}\"",
-        DEFAULT_SOLANA_KEYPAIR_PATH.to_string()
+        *DEFAULT_SOLANA_KEYPAIR_PATH
     )));
 
     for program_metadata in selected_programs.iter() {
@@ -188,10 +315,12 @@ pub fn scaffold_iac_layout(
             &framework.get_interpolated_program_deployment_template(&program_metadata.name),
         );
 
-        subgraph_runbook_src = framework.get_interpolated_subgraph_template(
-            &program_metadata.name,
-            program_metadata.idl.as_ref(),
-        )?;
+        if generate_subgraphs {
+            subgraph_runbook_src = framework.get_interpolated_subgraph_template(
+                &program_metadata.name,
+                program_metadata.idl.as_ref(),
+            )?;
+        }
 
         // Configure initialize instruction
         // let args = vec![

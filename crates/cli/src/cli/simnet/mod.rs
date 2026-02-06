@@ -5,7 +5,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
-    thread::sleep,
     time::Duration,
 };
 
@@ -22,17 +21,24 @@ use solana_keypair::Keypair;
 use solana_signer::Signer;
 use surfpool_core::{start_local_surfnet, surfnet::svm::SurfnetSvm};
 use surfpool_types::{SanitizedConfig, SimnetCommand, SimnetEvent, SubgraphEvent};
-use txtx_core::kit::{
-    channel::Receiver, futures::future::join_all, helpers::fs::FileLocation,
-    types::frontend::BlockEvent,
+use txtx_core::{
+    kit::{
+        channel::Receiver, futures::future::join_all, helpers::fs::FileLocation,
+        types::frontend::BlockEvent,
+    },
+    manifest::WorkspaceManifest,
+    types::RunbookSources,
 };
 use txtx_gql::kit::{indexmap::IndexMap, types::frontend::LogLevel, uuid::Uuid};
 
 use super::{Context, ExecuteRunbook, StartSimnet};
 use crate::{
     http::start_subgraph_and_explorer_server,
-    runbook::{execute_runbook, handle_log_event},
-    scaffold::{detect_program_frameworks, scaffold_iac_layout},
+    runbook::{execute_in_memory_runbook, execute_on_disk_runbook, handle_log_event},
+    scaffold::{
+        ProgramFrameworkData, detect_program_frameworks, scaffold_iac_layout,
+        scaffold_in_memory_iac,
+    },
     tui::{self, simnet::DisplayedUrl},
 };
 
@@ -54,7 +60,14 @@ pub async fn handle_start_local_surfnet_command(
     }
 
     // We start the simnet as soon as possible, as it needs to be ready for deployments
-    let (surfnet_svm, simnet_events_rx, geyser_events_rx) = SurfnetSvm::new();
+    let (mut surfnet_svm, simnet_events_rx, geyser_events_rx) =
+        SurfnetSvm::new_with_db(cmd.db.as_deref(), &cmd.surfnet_id)
+            .map_err(|e| format!("Failed to initialize Surfnet SVM: {}", e))?;
+
+    // Apply feature configuration from CLI flags
+    let feature_config = cmd.feature_config();
+    surfnet_svm.apply_feature_config(&feature_config);
+
     let (simnet_commands_tx, simnet_commands_rx) = crossbeam::channel::unbounded();
     let (subgraph_commands_tx, subgraph_commands_rx) = crossbeam::channel::unbounded();
     let (subgraph_events_tx, subgraph_events_rx) = crossbeam::channel::unbounded();
@@ -71,13 +84,51 @@ pub async fn handle_start_local_surfnet_command(
         Some(keypair)
     };
 
+    // Parse and merge snapshot files (multiple files supported, later files override earlier ones)
+    // The actual loading happens in the runloop after the locker is created
+    let snapshot = {
+        let mut merged_snapshot: std::collections::BTreeMap<
+            String,
+            Option<surfpool_types::AccountSnapshot>,
+        > = std::collections::BTreeMap::new();
+
+        for snapshot_path in &cmd.snapshot {
+            let file_location = FileLocation::from_path(std::path::PathBuf::from(snapshot_path));
+            let content = file_location
+                .read_content_as_utf8()
+                .map_err(|e| format!("Failed to read snapshot file '{}': {}", snapshot_path, e))?;
+            let snapshot_data: std::collections::BTreeMap<
+                String,
+                Option<surfpool_types::AccountSnapshot>,
+            > = serde_json::from_str(&content)
+                .map_err(|e| format!("Failed to parse snapshot JSON '{}': {}", snapshot_path, e))?;
+            let _ = simnet_events_tx.send(SimnetEvent::info(format!(
+                "Loaded {} accounts from snapshot file: {}",
+                snapshot_data.len(),
+                snapshot_path
+            )));
+
+            // Merge into the combined snapshot (later files override earlier ones)
+            merged_snapshot.extend(snapshot_data);
+        }
+
+        merged_snapshot
+    };
+
     // Build config
-    let config = cmd.surfpool_config(airdrop_addresses);
+    let config = cmd.surfpool_config(airdrop_addresses, snapshot);
 
     let studio_binding_address = config.studio.get_studio_base_url();
-    let rpc_url = format!("http://{}", config.rpc.get_rpc_base_url());
-    let ws_url = format!("ws://{}", config.rpc.get_ws_base_url());
-    let studio_url = format!("http://{}", studio_binding_address);
+
+    // Allow overriding public-facing URLs via environment variables
+    // This is useful when running behind a reverse proxy (e.g., Caddy, nginx)
+    let rpc_url = std::env::var("SURFPOOL_PUBLIC_RPC_URL")
+        .unwrap_or_else(|_| format!("http://{}", config.rpc.get_rpc_base_url()));
+    let ws_url = std::env::var("SURFPOOL_PUBLIC_WS_URL")
+        .unwrap_or_else(|_| format!("ws://{}", config.rpc.get_ws_base_url()));
+    let studio_url = std::env::var("SURFPOOL_PUBLIC_STUDIO_URL")
+        .unwrap_or_else(|_| format!("http://{}", studio_binding_address));
+
     let graphql_query_route_url = format!("{}/workspace/v1/graphql", studio_url);
     let rpc_datasource_url = config.simnets[0].get_sanitized_datasource_url();
 
@@ -91,11 +142,7 @@ pub async fn handle_start_local_surfnet_command(
         workspace: None,
     };
 
-    let subgraph_database_path = cmd
-        .subgraph_db
-        .as_ref()
-        .map(|p| p.as_str())
-        .unwrap_or(":memory:");
+    let subgraph_database_path = cmd.subgraph_db.as_deref().unwrap_or(":memory:");
     let explorer_handle = match start_subgraph_and_explorer_server(
         studio_binding_address,
         subgraph_database_path,
@@ -103,6 +150,7 @@ pub async fn handle_start_local_surfnet_command(
         subgraph_events_tx.clone(),
         subgraph_commands_rx,
         ctx,
+        !cmd.no_studio,
     )
     .await
     {
@@ -121,7 +169,8 @@ pub async fn handle_start_local_surfnet_command(
     let simnet_commands_tx_copy = simnet_commands_tx.clone();
     let config_copy = config.clone();
 
-    let _handle = hiro_system_kit::thread_named("simnet")
+    let simnet_events_tx_for_thread = simnet_events_tx.clone();
+    let simnet_handle = hiro_system_kit::thread_named("simnet")
         .spawn(move || {
             let future = start_local_surfnet(
                 surfnet_svm,
@@ -132,30 +181,41 @@ pub async fn handle_start_local_surfnet_command(
                 geyser_events_rx,
             );
             if let Err(e) = hiro_system_kit::nestable_block_on(future) {
-                error!("Simnet exited with error: {e}");
-                sleep(Duration::from_millis(500));
-                std::process::exit(1);
+                // Send the error through the event channel so the main thread can handle it
+                let _ = simnet_events_tx_for_thread.send(SimnetEvent::Aborted(e.to_string()));
             }
             Ok::<(), String>(())
         })
         .map_err(|e| format!("{}", e))?;
 
-    loop {
+    // Collect events that occur before Ready so we can re-send them to the TUI
+    let mut early_events = Vec::new();
+    let initial_transactions = loop {
         match simnet_events_rx.recv() {
-            Ok(SimnetEvent::Aborted(error)) => return Err(error),
+            Ok(SimnetEvent::Aborted(error)) => {
+                eprintln!("Error: {}", error);
+                return Err(error);
+            }
             Ok(SimnetEvent::Shutdown) => return Ok(()),
-            Ok(SimnetEvent::Ready) => break,
-            _other => continue,
+            Ok(SimnetEvent::Ready(initial_transactions)) => break initial_transactions,
+            Ok(other) => early_events.push(other),
+            Err(_) => continue,
         }
+    };
+
+    // Re-send early events (like snapshot loading messages) so the TUI receives them
+    for event in early_events {
+        let _ = simnet_events_tx.send(event);
     }
 
     for event in airdrop_events {
         let _ = simnet_events_tx.send(event);
     }
 
+    let simnet_commands_tx_copy = simnet_commands_tx.clone();
     let mut deploy_progress_rx = vec![];
     if !cmd.no_deploy {
-        match write_and_execute_iac(&cmd, &simnet_events_tx).await {
+        match write_and_execute_iac(&cmd, &simnet_events_tx, &simnet_commands_tx_copy).await {
             Ok(rx) => deploy_progress_rx.push(rx),
             Err(e) => {
                 let _ = simnet_events_tx.send(SimnetEvent::warn(format!(
@@ -168,7 +228,10 @@ pub async fn handle_start_local_surfnet_command(
     // Non blocking check for new versions
     #[cfg(feature = "version_check")]
     {
-        let local_version = env!("CARGO_PKG_VERSION");
+        let mut local_version = env!("CARGO_PKG_VERSION").to_string();
+        if cmd.ci {
+            local_version = format!("{}-ci", local_version);
+        }
         let response = txtx_gql::kit::reqwest::get(format!(
             "{}/api/versions?v=/{}",
             super::DEFAULT_CLOUD_URL,
@@ -201,12 +264,17 @@ pub async fn handle_start_local_surfnet_command(
         explorer_handle,
         ctx_cc,
         Some(runloop_terminator),
+        initial_transactions,
     )
     .await;
+
+    // Wait for the simnet thread to finish cleanup (including Drop/checkpoint)
+    let _ = simnet_handle.join();
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_service(
     cmd: StartSimnet,
     simnet_events_rx: Receiver<SimnetEvent>,
@@ -218,19 +286,21 @@ async fn start_service(
     explorer_handle: Option<ServerHandle>,
     _ctx: Context,
     runloop_terminator: Option<Arc<AtomicBool>>,
+    initial_transactions: u64,
 ) -> Result<(), String> {
     let displayed_url = if cmd.no_studio {
         DisplayedUrl::Datasource(sanitized_config)
     } else {
         DisplayedUrl::Studio(sanitized_config)
     };
+    let include_debug_logs = cmd.log_level.to_lowercase().eq("debug");
 
     // Start frontend - kept on main thread
     if cmd.daemon || cmd.no_tui {
         log_events(
             simnet_events_rx,
             subgraph_events_rx,
-            cmd.debug,
+            include_debug_logs,
             deploy_progress_rx,
             simnet_commands_tx,
             runloop_terminator.unwrap(),
@@ -239,16 +309,18 @@ async fn start_service(
         tui::simnet::start_app(
             simnet_events_rx,
             simnet_commands_tx,
-            cmd.debug,
+            include_debug_logs,
             deploy_progress_rx,
             displayed_url,
             breaker,
+            initial_transactions,
         )
         .map_err(|e| format!("{}", e))?;
     }
     if let Some(explorer_handle) = explorer_handle {
         let _ = explorer_handle.stop(true).await;
     }
+
     Ok(())
 }
 
@@ -262,8 +334,11 @@ fn log_events(
 ) -> Result<(), String> {
     let mut deployment_completed = false;
     let do_stop_loop = runloop_terminator.clone();
+    let terminate_tx = simnet_commands_tx.clone();
     ctrlc::set_handler(move || {
         do_stop_loop.store(true, Ordering::Relaxed);
+        // Send terminate command to allow graceful shutdown (Drop to run)
+        let _ = terminate_tx.send(SimnetCommand::Terminate(None));
     })
     .expect("Error setting Ctrl-C handler");
 
@@ -291,7 +366,12 @@ fn log_events(
             }
         }
 
-        let oper = selector.select();
+        // Use select_timeout to periodically check the termination flag
+        // This ensures Ctrl+C is responsive even when no events are arriving
+        let oper = match selector.select_timeout(Duration::from_millis(100)) {
+            Ok(oper) => oper,
+            Err(_) => continue, // Timeout - check termination flag at top of loop
+        };
         match oper.index() {
             0 => match oper.recv(&simnet_events_rx) {
                 Ok(event) => match event {
@@ -304,11 +384,7 @@ fn log_events(
                     SimnetEvent::EpochInfoUpdate(_) => {
                         info!("{}", event.epoch_info_update_msg());
                     }
-                    SimnetEvent::SystemClockUpdated(_) => {
-                        if include_debug_logs {
-                            info!("{}", event.clock_update_msg());
-                        }
-                    }
+                    SimnetEvent::SystemClockUpdated(_) => {}
                     SimnetEvent::ClockUpdate(_) => {}
                     SimnetEvent::ErrorLog(_dt, log) => {
                         error!("{}", log);
@@ -317,9 +393,7 @@ fn log_events(
                         info!("{}", log);
                     }
                     SimnetEvent::DebugLog(_dt, log) => {
-                        if include_debug_logs {
-                            debug!("{}", log);
-                        }
+                        debug!("{}", log);
                     }
                     SimnetEvent::WarnLog(_dt, log) => {
                         warn!("{}", log);
@@ -342,7 +416,7 @@ fn log_events(
                         error!("{}", error);
                         return Err(error);
                     }
-                    SimnetEvent::Ready => {}
+                    SimnetEvent::Ready(_) => {}
                     SimnetEvent::Connected(_rpc_url) => {}
                     SimnetEvent::Shutdown => {
                         break;
@@ -383,9 +457,7 @@ fn log_events(
                         info!("{}", log);
                     }
                     SubgraphEvent::DebugLog(_dt, log) => {
-                        if include_debug_logs {
-                            info!("{}", log);
-                        }
+                        debug!("{}", log);
                     }
                     SubgraphEvent::WarnLog(_dt, log) => {
                         warn!("{}", log);
@@ -400,16 +472,17 @@ fn log_events(
                 }
             },
             i => match oper.recv(&deploy_progress_rx[i - 2]) {
-                Ok(event) => match event {
-                    BlockEvent::LogEvent(log) => handle_log_event(
-                        &mut multi_progress,
-                        log,
-                        &log_filter,
-                        &mut active_spinners,
-                        false,
-                    ),
-                    _ => {}
-                },
+                Ok(event) => {
+                    if let BlockEvent::LogEvent(log) = event {
+                        handle_log_event(
+                            &mut multi_progress,
+                            log,
+                            &log_filter,
+                            &mut active_spinners,
+                            false,
+                        )
+                    }
+                }
                 Err(_e) => {
                     deployment_completed = true;
                 }
@@ -422,46 +495,96 @@ fn log_events(
 async fn write_and_execute_iac(
     cmd: &StartSimnet,
     simnet_events_tx: &Sender<SimnetEvent>,
+    simnet_commands_tx: &Sender<SimnetCommand>,
 ) -> Result<Receiver<BlockEvent>, String> {
-    // Are we in a project directory?
-    let deployment = detect_program_frameworks(&cmd.manifest_path)
-        .await
-        .map_err(|e| format!("Failed to detect project framework: {}", e))?;
-
     let (progress_tx, progress_rx) = crossbeam::channel::unbounded();
-    if let Some((framework, programs)) = deployment {
-        // Is infrastructure-as-code (IaC) already setup?
-        let base_location =
-            FileLocation::from_path_string(&cmd.manifest_path)?.get_parent_location()?;
-        let mut txtx_manifest_location = base_location.clone();
-        txtx_manifest_location.append_path("txtx.yml")?;
-        if !txtx_manifest_location.exists() {
-            // Scaffold IaC
-            scaffold_iac_layout(
-                &framework,
-                programs,
-                &base_location,
-                cmd.skip_runbook_generation_prompts,
-            )?;
+
+    let base_location =
+        FileLocation::from_path_string(&cmd.manifest_path)?.get_parent_location()?;
+    let mut txtx_manifest_location = base_location.clone();
+    txtx_manifest_location.append_path("txtx.yml")?;
+    let txtx_manifest_exists = txtx_manifest_location.exists();
+
+    let mut on_disk_runbook_data = None;
+    let mut in_memory_runbook_data = None;
+    let runbook_input = cmd.runbook_input.clone();
+
+    // If there were existing on-disk runbooks, we'll execute those instead of in-memory ones
+    // If there were no existing runbooks and the user requested autopilot, we'll generate and execute in-memory runbooks
+    // If there were no existing runbooks and the user did not request autopilot, we'll generate and execute on-disk runbooks
+    let do_execute_in_memory_runbooks = cmd.anchor_compat && !txtx_manifest_exists;
+    if !cmd.anchor_compat && txtx_manifest_exists {
+        let runbooks_ids_to_execute = cmd.runbooks.clone();
+        on_disk_runbook_data = Some((txtx_manifest_location.clone(), runbooks_ids_to_execute));
+    };
+
+    // Are we in a project directory?
+    if let Ok(deployment) =
+        detect_program_frameworks(&cmd.manifest_path, &cmd.anchor_test_config_paths).await
+    {
+        if let Some(ProgramFrameworkData {
+            framework,
+            programs,
+            genesis_accounts,
+            accounts,
+            accounts_dir,
+            clones,
+            generate_subgraphs,
+        }) = deployment
+        {
+            if let Some(clones) = clones.as_ref() {
+                if !clones.is_empty() {
+                    let _ = simnet_commands_tx.try_send(SimnetCommand::FetchRemoteAccounts(
+                        clones
+                            .iter()
+                            .map(|c| {
+                                c.parse().map_err(|e| {
+                                    format!("Failed to parse clone address {}: {}", c, e)
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                        cmd.datasource_rpc_url(),
+                    ));
+                }
+            }
+
+            // Is infrastructure-as-code (IaC) already setup?
+            let do_write_scaffold = !cmd.anchor_compat && !txtx_manifest_exists;
+            if do_write_scaffold {
+                // Scaffold IaC
+                scaffold_iac_layout(
+                    &framework,
+                    &programs,
+                    &base_location,
+                    cmd.skip_runbook_generation_prompts,
+                    generate_subgraphs,
+                )?;
+            }
+
+            if do_execute_in_memory_runbooks {
+                in_memory_runbook_data = Some(scaffold_in_memory_iac(
+                    &framework,
+                    &programs,
+                    &genesis_accounts,
+                    &accounts,
+                    &accounts_dir,
+                    generate_subgraphs,
+                )?);
+            }
         }
 
-        let mut futures = vec![];
-        let runbooks_ids_to_execute = cmd.runbooks.clone();
-        let simnet_events_tx_copy = simnet_events_tx.clone();
-        for runbook_id in runbooks_ids_to_execute.iter() {
-            futures.push(execute_runbook(
-                progress_tx.clone(),
-                simnet_events_tx_copy.clone(),
-                ExecuteRunbook::default_localnet(runbook_id)
-                    .with_manifest_path(txtx_manifest_location.to_string()),
-                false,
-            ));
-        }
+        let futures = assemble_runbook_execution_futures(
+            &progress_tx,
+            simnet_events_tx,
+            &on_disk_runbook_data,
+            &in_memory_runbook_data,
+            &runbook_input,
+        );
 
         let simnet_events_tx = simnet_events_tx.clone();
         let _handle = hiro_system_kit::thread_named("Deployment Runbook Executions")
             .spawn(move || {
-                let _ = hiro_system_kit::nestable_block_on(join_all(futures));
+                let _ = hiro_system_kit::nestable_block_on(join_all(futures.into_iter()));
                 Ok::<(), String>(())
             })
             .map_err(|e| format!("Thread to execute runbooks exited: {}", e))?;
@@ -498,6 +621,18 @@ async fn write_and_execute_iac(
                                 kind: EventKind::Create(CreateKind::File),
                                 paths,
                                 attrs: _,
+                            })
+                            // Linux: inotify reports Data(Any) instead of Data(Content)
+                            | Ok(Event {
+                                kind: EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+                                paths,
+                                attrs: _,
+                            })
+                            // Linux: atomic file replacement via rename
+                            | Ok(Event {
+                                kind: EventKind::Modify(ModifyKind::Name(_)),
+                                paths,
+                                attrs: _,
                             }) => {
                                 for path in paths.iter() {
                                     if path.to_string_lossy().ends_with(".so") {
@@ -512,17 +647,18 @@ async fn write_and_execute_iac(
                             continue;
                         }
 
-                        let mut futures = vec![];
-                        for runbook_id in runbooks_ids_to_execute.iter() {
-                            futures.push(execute_runbook(
-                                progress_tx.clone(),
-                                simnet_events_tx.clone(),
-                                ExecuteRunbook::default_localnet(runbook_id)
-                                    .with_manifest_path(txtx_manifest_location.to_string()),
-                                false,
-                            ));
-                        }
-                        let _ = hiro_system_kit::nestable_block_on(join_all(futures));
+                        let futures = assemble_runbook_execution_futures(
+                            &progress_tx,
+                            &simnet_events_tx,
+                            &on_disk_runbook_data,
+                            &in_memory_runbook_data,
+                            &runbook_input,
+                        );
+
+                        // Catch panics to keep the watch thread alive
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            hiro_system_kit::nestable_block_on(join_all(futures))
+                        }));
                     }
                     Ok::<(), String>(())
                 })
@@ -530,4 +666,54 @@ async fn write_and_execute_iac(
         }
     }
     Ok(progress_rx)
+}
+
+fn assemble_runbook_execution_futures(
+    progress_tx: &Sender<BlockEvent>,
+    simnet_events_tx: &Sender<SimnetEvent>,
+    on_disk_runbook_data: &Option<(FileLocation, Vec<String>)>,
+    in_memory_runbook_data: &Option<(String, RunbookSources, WorkspaceManifest)>,
+    runbook_input: &Vec<String>,
+) -> Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>> {
+    let mut futures: Vec<
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>,
+    > = vec![];
+    let simnet_events_tx_copy = simnet_events_tx.clone();
+    let do_setup_logger = false;
+    if let Some((runbook_id, runbook_sources, manifest)) = in_memory_runbook_data {
+        // Clone owned values so all arguments are 'static
+        let runbook_id_owned = runbook_id.clone();
+        let runbook_sources_owned = runbook_sources.clone();
+        let manifest_owned = manifest.clone();
+        futures.push(Box::pin(execute_in_memory_runbook(
+            progress_tx.clone(),
+            simnet_events_tx_copy.clone(),
+            ExecuteRunbook::default_localnet(&runbook_id_owned),
+            do_setup_logger,
+            runbook_id_owned,
+            manifest_owned,
+            runbook_sources_owned,
+        )));
+    }
+
+    if let Some((file_location, runbooks_ids_to_execute)) = on_disk_runbook_data {
+        let file_location_owned = file_location.clone();
+        let runbooks_ids_to_execute_owned = runbooks_ids_to_execute.clone();
+        let simnet_events_tx_copy = simnet_events_tx.clone();
+        for runbook_id in runbooks_ids_to_execute_owned.iter() {
+            let runbook_id_owned = runbook_id.clone();
+            futures.push(Box::pin(execute_on_disk_runbook(
+                progress_tx.clone(),
+                simnet_events_tx_copy.clone(),
+                {
+                    let mut ec = ExecuteRunbook::default_localnet(&runbook_id_owned)
+                        .with_manifest_path(file_location_owned.to_string());
+                    ec.inputs = runbook_input.clone();
+                    ec
+                },
+                do_setup_logger,
+            )));
+        }
+    }
+    futures
 }

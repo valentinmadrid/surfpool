@@ -12,7 +12,7 @@ use crossbeam_channel::{Receiver, Sender};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Visitor};
 use serde_with::{BytesOrString, serde_as};
 use solana_account::Account;
-use solana_account_decoder_client_types::{UiAccount, UiAccountEncoding};
+use solana_account_decoder_client_types::{ParsedAccount, UiAccount, UiAccountEncoding};
 use solana_clock::{Clock, Epoch, Slot};
 use solana_epoch_info::EpochInfo;
 use solana_message::inner_instruction::InnerInstructionsList;
@@ -25,7 +25,8 @@ use txtx_addon_kit::indexmap::IndexMap;
 use txtx_addon_network_svm_types::subgraph::SubgraphRequest;
 use uuid::Uuid;
 
-pub const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
+use crate::{DEFAULT_MAINNET_RPC_URL, SvmFeatureConfig};
+
 pub const DEFAULT_RPC_PORT: u16 = 8899;
 pub const DEFAULT_WS_PORT: u16 = 8900;
 pub const DEFAULT_STUDIO_PORT: u16 = 8488;
@@ -42,6 +43,7 @@ pub struct TransactionMetadata {
     pub inner_instructions: InnerInstructionsList,
     pub compute_units_consumed: u64,
     pub return_data: TransactionReturnData,
+    pub fee: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +60,32 @@ pub enum BlockProductionMode {
     Clock,
     Transaction,
     Manual,
+}
+
+impl fmt::Display for BlockProductionMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BlockProductionMode::Clock => write!(f, "clock"),
+            BlockProductionMode::Transaction => write!(f, "transaction"),
+            BlockProductionMode::Manual => write!(f, "manual"),
+        }
+    }
+}
+
+impl FromStr for BlockProductionMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "clock" => Ok(BlockProductionMode::Clock),
+            "transaction" => Ok(BlockProductionMode::Transaction),
+            "manual" => Ok(BlockProductionMode::Manual),
+            _ => Err(format!(
+                "Invalid block production mode: {}. Valid values are: clock, transaction, manual",
+                s
+            )),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -111,12 +139,13 @@ pub struct ComputeUnitsEstimationResult {
 }
 
 /// The struct for storing the profiling results.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeyedProfileResult {
     pub slot: u64,
     pub key: UuidOrSignature,
     pub instruction_profiles: Option<Vec<ProfileResult>>,
     pub transaction_profile: ProfileResult,
+    #[serde(with = "pubkey_account_map")]
     pub readonly_account_states: HashMap<Pubkey, Account>,
 }
 
@@ -138,9 +167,11 @@ impl KeyedProfileResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProfileResult {
+    #[serde(with = "pubkey_option_account_map")]
     pub pre_execution_capture: ExecutionCapture,
+    #[serde(with = "pubkey_option_account_map")]
     pub post_execution_capture: ExecutionCapture,
     pub compute_units_consumed: u64,
     pub log_messages: Option<Vec<String>>,
@@ -258,6 +289,7 @@ pub struct UiProfileResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", tag = "type", content = "accountChange")]
+#[allow(clippy::large_enum_variant)]
 pub enum UiAccountProfileState {
     Readonly,
     Writable(UiAccountChange),
@@ -282,7 +314,6 @@ pub enum UiAccountChange {
 ///
 /// Profile result 2 is from executing Ix 1 and Ix 2
 /// AccountProfileState::Writable(P, AccountChange::Update( UiAccount { lamports: 400, ...}, UiAccount { lamports: 500, ... }))
-
 pub mod profile_state_map {
     use super::*;
 
@@ -312,16 +343,81 @@ pub mod profile_state_map {
     }
 }
 
+/// Serialization module for HashMap<Pubkey, Account>
+pub mod pubkey_account_map {
+    use super::*;
+
+    pub fn serialize<S>(map: &HashMap<Pubkey, Account>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let str_map: HashMap<String, &Account> =
+            map.iter().map(|(k, v)| (k.to_string(), v)).collect();
+        str_map.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashMap<Pubkey, Account>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let str_map: HashMap<String, Account> = HashMap::deserialize(deserializer)?;
+        str_map
+            .into_iter()
+            .map(|(k, v)| {
+                Pubkey::from_str(&k)
+                    .map(|pk| (pk, v))
+                    .map_err(serde::de::Error::custom)
+            })
+            .collect()
+    }
+}
+
+/// Serialization module for BTreeMap<Pubkey, Option<Account>>
+pub mod pubkey_option_account_map {
+    use super::*;
+
+    pub fn serialize<S>(
+        map: &BTreeMap<Pubkey, Option<Account>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let str_map: BTreeMap<String, &Option<Account>> =
+            map.iter().map(|(k, v)| (k.to_string(), v)).collect();
+        str_map.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<BTreeMap<Pubkey, Option<Account>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let str_map: BTreeMap<String, Option<Account>> = BTreeMap::deserialize(deserializer)?;
+        str_map
+            .into_iter()
+            .map(|(k, v)| {
+                Pubkey::from_str(&k)
+                    .map(|pk| (pk, v))
+                    .map_err(serde::de::Error::custom)
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum SubgraphCommand {
     CreateCollection(Uuid, SubgraphRequest, Sender<String>),
     ObserveCollection(Receiver<DataIndexingCommand>),
+    DestroyCollection(Uuid), // Clean up collection on plugin unload
     Shutdown,
 }
 
 #[derive(Debug)]
 pub enum SimnetEvent {
-    Ready,
+    /// Surfnet is ready, with the initial count of processed transactions from storage
+    Ready(u64),
     Connected(String),
     Aborted(String),
     Shutdown,
@@ -455,21 +551,27 @@ pub enum SimnetCommand {
     SlotBackward(Option<Hash>),
     CommandClock(Option<(Hash, String)>, ClockCommand),
     UpdateInternalClock(Option<(Hash, String)>, Clock),
+    UpdateInternalClockWithConfirmation(Option<(Hash, String)>, Clock, Sender<EpochInfo>),
     UpdateBlockProductionMode(BlockProductionMode),
-    TransactionReceived(
+    ProcessTransaction(
         Option<(Hash, String)>,
         VersionedTransaction,
         Sender<TransactionStatusEvent>,
         bool,
+        Option<bool>,
     ),
     Terminate(Option<(Hash, String)>),
     StartRunbookExecution(String),
     CompleteRunbookExecution(String, Option<Vec<String>>),
+    FetchRemoteAccounts(Vec<Pubkey>, String),
+    AirdropProcessed,
 }
 
 #[derive(Debug)]
 pub enum ClockCommand {
     Pause,
+    /// Pause with confirmation - sends epoch info back when actually paused
+    PauseWithConfirmation(Sender<EpochInfo>),
     Resume,
     Toggle,
     UpdateSlotInterval(u64),
@@ -512,13 +614,21 @@ pub struct SimnetConfig {
     pub instruction_profiling_enabled: bool,
     pub max_profiles: usize,
     pub log_bytes_limit: Option<usize>,
+    pub feature_config: SvmFeatureConfig,
+    pub skip_signature_verification: bool,
+    /// Unique identifier for this surfnet instance. Used to isolate database storage
+    /// when multiple surfnets share the same database. Defaults to "default".
+    pub surfnet_id: String,
+    /// Snapshot accounts to preload at startup.
+    /// Keys are pubkey strings, values can be None to fetch from remote RPC.
+    pub snapshot: BTreeMap<String, Option<AccountSnapshot>>,
 }
 
 impl Default for SimnetConfig {
     fn default() -> Self {
         Self {
             offline_mode: false,
-            remote_rpc_url: Some(DEFAULT_RPC_URL.to_string()),
+            remote_rpc_url: Some(DEFAULT_MAINNET_RPC_URL.to_string()),
             slot_time: DEFAULT_SLOT_TIME_MS, // Default to 400ms to match CLI default
             block_production_mode: BlockProductionMode::Clock,
             airdrop_addresses: vec![],
@@ -527,33 +637,46 @@ impl Default for SimnetConfig {
             instruction_profiling_enabled: true,
             max_profiles: DEFAULT_PROFILING_MAP_CAPACITY,
             log_bytes_limit: Some(10_000),
+            feature_config: SvmFeatureConfig::default(),
+            skip_signature_verification: false,
+            surfnet_id: "default".to_string(),
+            snapshot: BTreeMap::new(),
         }
     }
 }
 
 impl SimnetConfig {
+    /// Returns a sanitized version of the datasource URL safe for display.
+    /// Only returns scheme and host (e.g., "https://example.com") to prevent
+    /// leaking API keys in paths or query parameters.
     pub fn get_sanitized_datasource_url(&self) -> Option<String> {
-        let Some(raw) = self.remote_rpc_url.as_ref() else {
-            return None;
-        };
-        let base = raw
-            .split('?')
-            .next()
-            .map(|s| s.trim())
-            .unwrap_or_default()
-            .to_string();
-        if base.is_empty() { None } else { Some(base) }
+        let raw = self.remote_rpc_url.as_ref()?;
+
+        if let Ok(url) = url::Url::parse(raw) {
+            let scheme = url.scheme();
+            let host = url.host_str()?;
+            Some(format!("{}://{}", scheme, host))
+        } else {
+            None
+        }
     }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct SubgraphConfig {}
 
+pub const DEFAULT_GOSSIP_PORT: u16 = 8001;
+pub const DEFAULT_TPU_PORT: u16 = 8003;
+pub const DEFAULT_TPU_QUIC_PORT: u16 = 8004;
+
 #[derive(Clone, Debug)]
 pub struct RpcConfig {
     pub bind_host: String,
     pub bind_port: u16,
     pub ws_port: u16,
+    pub gossip_port: u16,
+    pub tpu_port: u16,
+    pub tpu_quic_port: u16,
 }
 
 impl RpcConfig {
@@ -571,6 +694,9 @@ impl Default for RpcConfig {
             bind_host: DEFAULT_NETWORK_HOST.to_string(),
             bind_port: DEFAULT_RPC_PORT,
             ws_port: DEFAULT_WS_PORT,
+            gossip_port: DEFAULT_GOSSIP_PORT,
+            tpu_port: DEFAULT_TPU_PORT,
+            tpu_quic_port: DEFAULT_TPU_QUIC_PORT,
         }
     }
 }
@@ -604,24 +730,87 @@ pub struct SubgraphPluginConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct SvmSimnetInitializationRequest {
+#[serde(rename_all = "snake_case")]
+pub struct CreateSurfnetRequest {
     pub domain: String,
     pub block_production_mode: BlockProductionMode,
     pub datasource_rpc_url: String,
     pub settings: Option<CloudSurfnetSettings>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "snake_case", default)]
 pub struct CloudSurfnetSettings {
+    pub database_url: Option<String>,
     pub profiling_disabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gating: Option<CloudSurfnetRpcGating>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "snake_case", default)]
+pub struct CloudSurfnetRpcGating {
+    pub private_methods_secret_token: Option<String>,
+    pub private_methods: Vec<String>,
+    pub public_methods: Vec<String>,
+    pub disabled_methods: Vec<String>,
+}
+
+impl CloudSurfnetRpcGating {
+    pub fn restricted() -> CloudSurfnetRpcGating {
+        CloudSurfnetRpcGating {
+            private_methods: vec![],
+            private_methods_secret_token: None,
+            public_methods: vec![],
+            disabled_methods: vec![
+                "surfnet_cloneProgramAccount".into(),
+                "surfnet_profileTransaction".into(),
+                "surfnet_getProfileResultsByTag".into(),
+                "surfnet_setSupply".into(),
+                "surfnet_setProgramAuthority".into(),
+                "surfnet_getTransactionProfile".into(),
+                "surfnet_registerIdl".into(),
+                "surfnet_getActiveIdl".into(),
+                "surfnet_getLocalSignatures".into(),
+                "surfnet_timeTravel".into(),
+                "surfnet_pauseClock".into(),
+                "surfnet_resumeClock".into(),
+                "surfnet_resetAccount".into(),
+                "surfnet_resetNetwork".into(),
+                "surfnet_exportSnapshot".into(),
+                "surfnet_streamAccount".into(),
+                "surfnet_getStreamedAccounts".into(),
+            ],
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum SvmSimnetCommand {
-    Init(SvmSimnetInitializationRequest),
+#[serde(rename_all = "snake_case")]
+pub struct CreateSubgraphRequest {
+    pub subgraph_id: Uuid,
+    pub subgraph_revision_id: Uuid,
+    pub revision_number: i32,
+    pub start_block: i64,
+    pub network: String,
+    pub workspace_slug: String,
+    pub request: SubgraphRequest,
+    pub settings: Option<CloudSubgraphSettings>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "snake_case")]
+pub struct CloudSubgraphSettings {}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum SvmCloudCommand {
+    CreateSurfnet(CreateSurfnetRequest),
+    CreateSubgraph(CreateSubgraphRequest),
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct CreateNetworkRequest {
     pub workspace_id: Uuid,
     pub name: String,
@@ -799,7 +988,7 @@ impl<'de> Deserialize<'de> for UuidOrSignature {
     }
 }
 
-impl<'de> Serialize for UuidOrSignature {
+impl Serialize for UuidOrSignature {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -820,7 +1009,7 @@ pub enum DataIndexingCommand {
 }
 
 // Define a wrapper struct
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionedIdl(pub Slot, pub Idl);
 
 // Implement ordering based on Slot
@@ -850,15 +1039,16 @@ pub struct FifoMap<K, V> {
     map: IndexMap<K, V>,
 }
 
+impl<K: std::hash::Hash + Eq, V> Default for FifoMap<K, V> {
+    fn default() -> Self {
+        Self::new(DEFAULT_PROFILING_MAP_CAPACITY)
+    }
+}
 impl<K: std::hash::Hash + Eq, V> FifoMap<K, V> {
     pub fn new(capacity: usize) -> Self {
         Self {
             map: IndexMap::with_capacity(capacity),
         }
-    }
-
-    pub fn default() -> Self {
-        Self::new(DEFAULT_PROFILING_MAP_CAPACITY)
     }
 
     pub fn capacity(&self) -> usize {
@@ -869,24 +1059,33 @@ impl<K: std::hash::Hash + Eq, V> FifoMap<K, V> {
         self.map.len()
     }
 
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
 
     /// Insert a key/value. If `K` is new and we're full, evict the oldest (FIFO)
-    /// Returns the old value if this was an update.
-    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+    /// Returns a tuple of (old_value, evicted_key):
+    /// - old_value: The previous value if this was an update to an existing key
+    /// - evicted_key: The key that was evicted if the map was at capacity
+    pub fn insert(&mut self, key: K, value: V) -> (Option<V>, Option<K>) {
         if self.map.contains_key(&key) {
             // Update doesn't change insertion order in IndexMap
-            return self.map.insert(key, value);
+            return (self.map.insert(key, value), None);
         }
-        if self.map.len() == self.map.capacity() {
+        let evicted_key = if self.map.len() == self.map.capacity() {
             // Evict oldest (index 0). O(n) due shifting the rest of the map
             // We could use a hashmap + vecdeque to get O(1) here, but then we'd have to handle removing from both maps, storing the index, and managing the eviction.
             // This is a good compromise between performance and simplicity. And thinking about memory usage, this is probably the best way to go.
-            let _ = self.map.shift_remove_index(0);
-        }
-        self.map.insert(key, value)
+            self.map.shift_remove_index(0).map(|(k, _)| k)
+        } else {
+            None
+        };
+        self.map.insert(key, value);
+        (None, evicted_key)
     }
 
     pub fn get(&self, key: &K) -> Option<&V> {
@@ -901,6 +1100,11 @@ impl<K: std::hash::Hash + Eq, V> FifoMap<K, V> {
         self.map.contains_key(key)
     }
 
+    /// Removes a key from the map, returning the value if present.
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        self.map.shift_remove(key)
+    }
+
     // This is a wrapper around the IndexMap::iter() method, but it preserves the insertion order of the keys.
     // It's used to iterate over the profiling map in the order of the keys being inserted.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&K, &V)> {
@@ -908,17 +1112,94 @@ impl<K: std::hash::Hash + Eq, V> FifoMap<K, V> {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSnapshot {
+    pub lamports: u64,
+    pub owner: String,
+    pub executable: bool,
+    pub rent_epoch: u64,
+    /// Base64 encoded data
+    pub data: String,
+    /// Parsed account data if available
+    pub parsed_data: Option<ParsedAccount>,
+}
+
+impl AccountSnapshot {
+    pub fn new(
+        lamports: u64,
+        owner: String,
+        executable: bool,
+        rent_epoch: u64,
+        data: String,
+        parsed_data: Option<ParsedAccount>,
+    ) -> Self {
+        Self {
+            lamports,
+            owner,
+            executable,
+            rent_epoch,
+            data,
+            parsed_data,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSnapshotConfig {
+    pub include_parsed_accounts: Option<bool>,
+    pub filter: Option<ExportSnapshotFilter>,
+    pub scope: ExportSnapshotScope,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExportSnapshotScope {
+    #[default]
+    Network,
+    PreTransaction(String),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSnapshotFilter {
+    pub include_program_accounts: Option<bool>,
+    pub include_accounts: Option<Vec<String>>,
+    pub exclude_accounts: Option<Vec<String>>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResetAccountConfig {
-    pub recursive: Option<bool>,
+    pub include_owned_accounts: Option<bool>,
 }
 
 impl Default for ResetAccountConfig {
     fn default() -> Self {
         Self {
-            recursive: Some(false),
+            include_owned_accounts: Some(false),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StreamAccountConfig {
+    pub include_owned_accounts: Option<bool>,
+}
+
+impl Default for StreamAccountConfig {
+    fn default() -> Self {
+        Self {
+            include_owned_accounts: Some(false),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamedAccountInfo {
+    pub pubkey: String,
+    pub include_owned_accounts: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -929,6 +1210,27 @@ pub struct GetSurfnetInfoResponse {
 impl GetSurfnetInfoResponse {
     pub fn new(runbook_executions: Vec<RunbookExecutionStatusReport>) -> Self {
         Self { runbook_executions }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetStreamedAccountsResponse {
+    accounts: Vec<StreamedAccountInfo>,
+}
+impl GetStreamedAccountsResponse {
+    pub fn from_iter<I>(streamed_accounts: I) -> Self
+    where
+        I: IntoIterator<Item = (String, bool)>,
+    {
+        let accounts = streamed_accounts
+            .into_iter()
+            .map(|(pubkey, include_owned_accounts)| StreamedAccountInfo {
+                pubkey,
+                include_owned_accounts,
+            })
+            .collect();
+        Self { accounts }
     }
 }
 
@@ -1235,5 +1537,104 @@ mod tests {
         let get: Vec<_> = profiling_map.iter().map(|(k, v)| (*k, *v)).collect();
         println!("Profiling map: {:?}", get);
         assert_eq!(get, vec![("b", 4), ("c", 3), ("d", 4), ("e", 5)]);
+    }
+
+    #[test]
+    fn test_export_snapshot_scope_serialization() {
+        // Test Network variant
+        let network_config = ExportSnapshotConfig {
+            include_parsed_accounts: None,
+            filter: None,
+            scope: ExportSnapshotScope::Network,
+        };
+        let network_json = serde_json::to_value(&network_config).unwrap();
+        println!(
+            "Network config: {}",
+            serde_json::to_string_pretty(&network_json).unwrap()
+        );
+        assert_eq!(network_json["scope"], json!("network"));
+
+        // Test PreTransaction variant
+        let pre_tx_config = ExportSnapshotConfig {
+            include_parsed_accounts: None,
+            filter: None,
+            scope: ExportSnapshotScope::PreTransaction("5signature123".to_string()),
+        };
+        let pre_tx_json = serde_json::to_value(&pre_tx_config).unwrap();
+        println!(
+            "PreTransaction config: {}",
+            serde_json::to_string_pretty(&pre_tx_json).unwrap()
+        );
+        assert_eq!(
+            pre_tx_json["scope"],
+            json!({"preTransaction": "5signature123"})
+        );
+
+        // Test deserialization
+        let deserialized_network: ExportSnapshotConfig =
+            serde_json::from_value(network_json).unwrap();
+        assert_eq!(deserialized_network.scope, ExportSnapshotScope::Network);
+
+        let deserialized_pre_tx: ExportSnapshotConfig =
+            serde_json::from_value(pre_tx_json).unwrap();
+        assert_eq!(
+            deserialized_pre_tx.scope,
+            ExportSnapshotScope::PreTransaction("5signature123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sanitize_datasource_url_strips_path_and_query() {
+        // API key in path should be stripped
+        let config = SimnetConfig {
+            remote_rpc_url: Some(
+                "https://example.rpc-provider.com/v2/abc123def456ghi789".to_string(),
+            ),
+            ..Default::default()
+        };
+        let sanitized = config.get_sanitized_datasource_url().unwrap();
+        assert_eq!(sanitized, "https://example.rpc-provider.com");
+        assert!(!sanitized.contains("abc123"));
+    }
+
+    #[test]
+    fn test_sanitize_datasource_url_strips_query_params() {
+        let config = SimnetConfig {
+            remote_rpc_url: Some(
+                "https://mainnet.helius-rpc.com/?api-key=secret-key-12345".to_string(),
+            ),
+            ..Default::default()
+        };
+        let sanitized = config.get_sanitized_datasource_url().unwrap();
+        assert_eq!(sanitized, "https://mainnet.helius-rpc.com");
+        assert!(!sanitized.contains("secret-key"));
+    }
+
+    #[test]
+    fn test_sanitize_datasource_url_public_rpc() {
+        let config = SimnetConfig {
+            remote_rpc_url: Some("https://api.mainnet-beta.solana.com".to_string()),
+            ..Default::default()
+        };
+        let sanitized = config.get_sanitized_datasource_url().unwrap();
+        assert_eq!(sanitized, "https://api.mainnet-beta.solana.com");
+    }
+
+    #[test]
+    fn test_sanitize_datasource_url_none() {
+        let config = SimnetConfig {
+            remote_rpc_url: None,
+            ..Default::default()
+        };
+        assert!(config.get_sanitized_datasource_url().is_none());
+    }
+
+    #[test]
+    fn test_sanitize_datasource_url_invalid() {
+        let config = SimnetConfig {
+            remote_rpc_url: Some("not-a-valid-url".to_string()),
+            ..Default::default()
+        };
+        assert!(config.get_sanitized_datasource_url().is_none());
     }
 }

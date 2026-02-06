@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use jsonrpc_core::{BoxFuture, Error, Result, futures::future};
 use jsonrpc_derive::rpc;
@@ -10,10 +12,11 @@ use solana_program_option::COption;
 use solana_rpc_client_api::response::Response as RpcResponse;
 use solana_system_interface::program as system_program;
 use solana_transaction::versioned::VersionedTransaction;
-use spl_associated_token_account::get_associated_token_address_with_program_id;
+use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
 use surfpool_types::{
-    ClockCommand, GetSurfnetInfoResponse, Idl, ResetAccountConfig, RpcProfileResultConfig,
-    SimnetCommand, SimnetEvent, UiKeyedProfileResult,
+    AccountSnapshot, ClockCommand, ExportSnapshotConfig, GetStreamedAccountsResponse,
+    GetSurfnetInfoResponse, Idl, ResetAccountConfig, RpcProfileResultConfig, Scenario,
+    SimnetCommand, SimnetEvent, StreamAccountConfig, UiKeyedProfileResult,
     types::{AccountUpdate, SetSomeAccount, SupplyUpdate, TokenAccountUpdate, UuidOrSignature},
 };
 
@@ -137,7 +140,6 @@ pub trait SurfnetCheatcodes {
     /// and rent epoch of a given account.
     ///
     /// ## Parameters
-    /// - `meta`: Metadata passed with the request, such as the client's request context.
     /// - `pubkey`: The public key of the account to be updated, as a base-58 encoded string.
     /// - `update`: The `AccountUpdate` struct containing the fields to update the account.
     ///
@@ -183,7 +185,6 @@ pub trait SurfnetCheatcodes {
     /// including the token amount, delegate, state, delegated amount, and close authority.
     ///
     /// ## Parameters
-    /// - `meta`: Metadata passed with the request, such as the client's request context.
     /// - `owner`: The base-58 encoded public key of the token account's owner.
     /// - `mint`: The base-58 encoded public key of the token mint (e.g., the token type).
     /// - `update`: The `TokenAccountUpdate` struct containing the fields to update the token account.
@@ -242,7 +243,6 @@ pub trait SurfnetCheatcodes {
     /// potential errors.
     ///
     /// ## Parameters
-    /// - `meta`: Metadata passed with the request.
     /// - `transaction_data`: A base64 encoded string of the `VersionedTransaction`.
     /// - `tag`: An optional tag for the transaction.
     /// - `encoding`: An optional encoding for returned account data.
@@ -271,7 +271,6 @@ pub trait SurfnetCheatcodes {
     /// Retrieves all profiling results for a given tag.
     ///
     /// ## Parameters
-    /// - `meta`: Metadata passed with the request.
     /// - `tag`: The tag to retrieve profiling results for.
     ///
     /// ## Returns
@@ -291,10 +290,9 @@ pub trait SurfnetCheatcodes {
     /// by the `getSupply` RPC method.
     ///
     /// ## Parameters
-    /// - `meta`: Metadata passed with the request, such as the client's request context.
     /// - `update`: The `SupplyUpdate` struct containing the optional fields to update:
     ///   - `total`: Optional total supply in lamports
-    ///   - `circulating`: Optional circulating supply in lamports  
+    ///   - `circulating`: Optional circulating supply in lamports
     ///   - `non_circulating`: Optional non-circulating supply in lamports
     ///   - `non_circulating_accounts`: Optional list of non-circulating account addresses
     ///
@@ -344,7 +342,6 @@ pub trait SurfnetCheatcodes {
     /// This method allows developers to directly patch the upgrade authority of a program's ProgramData account.
     ///
     /// ## Parameters
-    /// - `meta`: Metadata passed with the request, such as the client's request context.
     /// - `program_id`: The base-58 encoded public key of the program.
     /// - `new_authority`: The base-58 encoded public key of the new authority. If omitted, the program will have no upgrade authority.
     ///
@@ -383,7 +380,6 @@ pub trait SurfnetCheatcodes {
     /// A cheat code to get the transaction profile for a given signature or UUID.
     ///
     /// ## Parameters
-    /// - `meta`: Metadata passed with the request, such as the client's request context.
     /// - `signature_or_uuid`: The transaction signature (as a base-58 string) or a UUID (as a string) for which to retrieve the profile.
     ///
     /// ## Returns
@@ -424,7 +420,6 @@ pub trait SurfnetCheatcodes {
     /// A cheat code to register an IDL for a given program in memory.
     ///
     /// ## Parameters
-    /// - `meta`: Metadata passed with the request, such as the client's request context.
     /// - `idl`: The full IDL object to be registered in memory. The `address` field should match the program's public key.
     /// - `slot` (optional): The slot at which to register the IDL. If omitted, uses the latest slot.
     ///
@@ -522,7 +517,6 @@ pub trait SurfnetCheatcodes {
     /// A cheat code to get the registered IDL for a given program ID.
     ///
     /// ## Parameters
-    /// - `meta`: Metadata passed with the request, such as the client's request context.
     /// - `program_id`: The base-58 encoded public key of the program whose IDL is being requested.
     /// - `slot` (optional): The slot at which to query the IDL. If omitted, uses the latest slot.
     ///
@@ -717,7 +711,6 @@ pub trait SurfnetCheatcodes {
     /// A cheat code to reset an account on the local network.
     ///
     /// ## Parameters
-    /// - `meta`: Metadata passed with the request, such as the client's request context.
     /// - `pubkey_str`: The base-58 encoded public key of the account to reset.
     /// - `config`: A `ResetAccountConfig` specifying how to reset the account. If omitted, the account will be reset without cascading to owned accounts.
     ///
@@ -730,7 +723,7 @@ pub trait SurfnetCheatcodes {
     ///   "jsonrpc": "2.0",
     ///   "id": 1,
     ///   "method": "surfnet_resetAccount",
-    ///   "params": [ "4EXSeLGxVBpAZwq7vm6evLdewpcvE2H56fpqL2pPiLFa", { "recursive": true } ]
+    ///   "params": [ "4EXSeLGxVBpAZwq7vm6evLdewpcvE2H56fpqL2pPiLFa", { "includeOwnedAccounts": true } ]
     /// }
     /// ```
     ///
@@ -756,10 +749,185 @@ pub trait SurfnetCheatcodes {
         config: Option<ResetAccountConfig>,
     ) -> Result<RpcResponse<()>>;
 
-    /// A cheat code to get Surfnet network information.
+    /// A cheat code to reset a network.
+    ///
+    /// ## Returns
+    /// An `RpcResponse<()>` indicating whether the network reset was successful.
+    ///
+    /// ## Example Request
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "id": 1,
+    ///   "method": "surfnet_resetNetwork",    /// }
+    /// ```
+    ///
+    /// ## Example Response
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "result": {
+    ///     "context": {
+    ///       "slot": 123456789,
+    ///       "apiVersion": "2.3.8"
+    ///     },
+    ///     "value": null    ///   },
+    ///   "id": 1
+    /// }
+    /// ```
+    ///
+
+    #[rpc(meta, name = "surfnet_resetNetwork")]
+    fn reset_network(&self, meta: Self::Metadata) -> BoxFuture<Result<RpcResponse<()>>>;
+
+    /// A cheat code to export a snapshot of all accounts in the Surfnet SVM.
+    ///
+    /// This method retrieves the current state of all accounts stored in the Surfnet Virtual Machine (SVM)
+    /// and returns them as a mapping of account public keys to their respective account snapshots.
     ///
     /// ## Parameters
-    /// - `meta`: Metadata passed with the request, such as the client's request context.
+    /// - `config`: An optional `ExportSnapshotConfig` to customize the export behavior. The config fields are:
+    ///     - `includeParsedAccounts`: If true, includes parsed account data in the snapshot.
+    ///     - `filter`: An optional filter config to limit which accounts are included in the snapshot. Fields include:
+    ///         - `includeProgramAccounts`: A boolean indicating whether to include program accounts.
+    ///         - `includeAccounts`: A list of specific account public keys to include.
+    ///         - `excludeAccounts`: A list of specific account public keys to exclude.
+    ///     - `scope`: An optional scope to limit the accounts included in the snapshot. Options include:
+    ///         - `network`: Includes all accounts in the network.
+    ///         - `preTransaction`: Only includes accounts touched by the given transaction.
+    ///
+    ///
+    /// ## Returns
+    /// An `RpcResponse<BTreeMap<String, AccountSnapshot>>` containing the exported account snapshots.
+    ///
+    /// The keys of the map are the base-58 encoded public keys of the accounts,
+    /// and the values are the corresponding `AccountSnapshot` objects.
+    ///
+    /// ## Example Request
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "id": 1,
+    ///   "method": "surfnet_exportSnapshot"
+    /// }
+    /// ```
+    ///
+    /// ## Example Response
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "result": {
+    ///     "4EXSeLGxVBpAZwq7vm6evLdewpcvE2H56fpqL2pPiLFa": {
+    ///       "lamports": 1000000,
+    ///       "owner": "11111111111111111111111111111111",
+    ///       "executable": false,
+    ///       "rent_epoch": 0,
+    ///       "data": "base64_encoded_data_string"
+    ///     },
+    ///     "AnotherAccountPubkeyBase58": {
+    ///       "lamports": 500000,
+    ///       "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    ///       "executable": false,
+    ///       "rent_epoch": 0,
+    ///       "data": "base64_encoded_data_string"
+    ///     }
+    ///   },
+    ///   "id": 1
+    /// }
+    /// ```
+    ///
+    #[rpc(meta, name = "surfnet_exportSnapshot")]
+    fn export_snapshot(
+        &self,
+        meta: Self::Metadata,
+        config: Option<ExportSnapshotConfig>,
+    ) -> Result<RpcResponse<BTreeMap<String, AccountSnapshot>>>;
+
+    /// A cheat code to simulate account streaming.
+    /// When a transaction is processed, the accounts that are accessed are downloaded from the datasource and cached in the SVM.
+    /// With this method, you can simulate the streaming of accounts by providing a pubkey.
+    ///
+    /// ## Parameters
+    /// - `pubkey_str`: The base-58 encoded public key of the account to stream.
+    /// - `config`: A `StreamAccountConfig` specifying how to stream the account. If omitted, the account will be streamed without cascading to owned accounts.
+    ///
+    /// ## Returns
+    /// An `RpcResponse<()>` indicating whether the account stream registration was successful.
+    ///
+    /// ## Example Request
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "id": 1,
+    ///   "method": "surfnet_streamAccount",
+    ///   "params": [ "4EXSeLGxVBpAZwq7vm6evLdewpcvE2H56fpqL2pPiLFa", { "includeOwnedAccounts": true } ]
+    /// }
+    /// ```
+    ///
+    /// ## Example Response
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "result": {
+    ///     "context": {
+    ///       "slot": 123456789,
+    ///       "apiVersion": "2.3.8"
+    ///     },
+    ///     "value": null
+    ///   },
+    ///   "id": 1
+    /// }
+    /// ```
+    #[rpc(meta, name = "surfnet_streamAccount")]
+    fn stream_account(
+        &self,
+        meta: Self::Metadata,
+        pubkey_str: String,
+        config: Option<StreamAccountConfig>,
+    ) -> Result<RpcResponse<()>>;
+
+    /// A cheat code to retrieve the streamed accounts.
+    /// When a transaction is processed, the accounts that are accessed are downloaded from the datasource and cached in the SVM.
+    /// With this method, you can simulate the streaming of accounts by providing a pubkey.
+    ///
+    /// ## Parameters
+    ///
+    /// ## Returns
+    /// An `RpcResponse<()>` indicating whether the account stream registration was successful.
+    ///
+    /// ## Example Request
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "id": 1,
+    ///   "method": "surfnet_getStreamedAccounts",
+    ///   "params": []
+    /// }
+    /// ```
+    ///
+    /// ## Example Response
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "result": {
+    ///     "context": {
+    ///       "slot": 123456789,
+    ///       "apiVersion": "2.3.8"
+    ///     },
+    ///     "value": [
+    ///       "4EXSeLGxVBpAZwq7vm6evLdewpcvE2H56fpqL2pPiLFa"
+    ///     ]
+    ///    },
+    ///   "id": 1
+    /// }
+    /// ```
+    #[rpc(meta, name = "surfnet_getStreamedAccounts")]
+    fn get_streamed_accounts(
+        &self,
+        meta: Self::Metadata,
+    ) -> Result<RpcResponse<GetStreamedAccountsResponse>>;
+
+    /// A cheat code to get Surfnet network information.
     ///
     /// ## Returns
     /// A `RpcResponse<GetSurfnetInfoResponse>` containing the Surfnet network information.
@@ -799,6 +967,167 @@ pub trait SurfnetCheatcodes {
     #[rpc(meta, name = "surfnet_getSurfnetInfo")]
     fn get_surfnet_info(&self, meta: Self::Metadata)
     -> Result<RpcResponse<GetSurfnetInfoResponse>>;
+
+    /// A "cheat code" method for developers to write program data at a specified offset in Surfpool.
+    ///
+    /// This method allows developers to write large Solana programs by sending data in chunks,
+    /// bypassing transaction size limits by using RPC size limits (5MB) instead.
+    ///
+    /// ## Parameters
+    /// - `program_id`: The public key of the program account, as a base-58 encoded string.
+    /// - `data`: Hex-encoded program data chunk to write.
+    /// - `offset`: The byte offset at which to write this data chunk.
+    /// - `authority` (optional): The base-58 encoded public key of the authority allowed to write to the program. If omitted, defaults to the system program.
+    ///
+    /// ## Returns
+    /// A `RpcResponse<()>` indicating whether the write was successful.
+    ///
+    /// ## Example Request
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "id": 1,
+    ///   "method": "surfnet_writeProgram",
+    ///   "params": [
+    ///     "program_pubkey",
+    ///     "deadbeef...",
+    ///     0
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// ## Example Response
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "result": {},
+    ///   "id": 1
+    /// }
+    /// ```
+    ///
+    /// # Notes
+    /// This method is designed to help developers deploy large programs by writing data incrementally.
+    /// Multiple calls can be made with different offsets to build the complete program.
+    /// The program account and program data account will be created automatically if they don't exist.
+    #[rpc(meta, name = "surfnet_writeProgram")]
+    fn write_program(
+        &self,
+        meta: Self::Metadata,
+        program_id: String,
+        data: String,
+        offset: usize,
+        authority: Option<String>,
+    ) -> BoxFuture<Result<RpcResponse<()>>>;
+
+    /// A cheat code to register a scenario with account overrides.
+    ///
+    /// ## Parameters
+    /// - `scenario`: The Scenario object containing:
+    ///   - `id`: Unique identifier for the scenario
+    ///   - `name`: Human-readable name
+    ///   - `description`: Description of the scenario
+    ///   - `overrides`: Array of OverrideInstance objects, each containing:
+    ///     - `id`: Unique identifier for this override instance
+    ///     - `templateId`: Reference to the override template
+    ///     - `values`: HashMap of field paths to override values
+    ///     - `scenarioRelativeSlot`: The relative slot offset (from base slot) when this override should be applied
+    ///     - `label`: Optional label for this override
+    ///     - `enabled`: Whether this override is active
+    ///     - `fetchBeforeUse`: If true, fetch fresh account data just before transaction execution (useful for price feeds, oracle updates, and dynamic balances)
+    ///     - `account`: Account address (either `{ "pubkey": "..." }` or `{ "pda": { "programId": "...", "seeds": [...] } }`)
+    ///   - `tags`: Array of tags for categorization
+    /// - `slot` (optional): The base slot from which relative slot offsets are calculated. If omitted, uses the current slot.
+    ///
+    /// ## Returns
+    /// A `RpcResponse<()>` indicating whether the Scenario registration was successful.
+    ///
+    /// ## Example Request (with slot)
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "id": 1,
+    ///   "method": "surfnet_registerScenario",
+    ///   "params": [
+    ///     {
+    ///       "id": "scenario-1",
+    ///       "name": "Price Feed Override",
+    ///       "description": "Override Pyth BTC/USD price at specific slots",
+    ///       "overrides": [
+    ///         {
+    ///           "id": "override-1",
+    ///           "templateId": "pyth_btcusd",
+    ///           "values": {
+    ///             "price_message.price_value": 67500,
+    ///             "price_message.conf": 100,
+    ///             "price_message.expo": -8
+    ///           },
+    ///           "scenarioRelativeSlot": 100,
+    ///           "label": "Set BTC price to $67,500",
+    ///           "enabled": true,
+    ///           "fetchBeforeUse": false,
+    ///           "account": {
+    ///             "pubkey": "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4QJNYH"
+    ///           }
+    ///         }
+    ///       ],
+    ///       "tags": ["defi", "price-feed"]
+    ///     },
+    ///     355684457
+    ///   ]
+    /// }
+    /// ```
+    /// ## Example Request (without slot)
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "id": 1,
+    ///   "method": "surfnet_registerScenario",
+    ///   "params": [
+    ///     {
+    ///       "id": "scenario-1",
+    ///       "name": "Price Feed Override",
+    ///       "description": "Override Pyth BTC/USD price",
+    ///       "overrides": [
+    ///         {
+    ///           "id": "override-1",
+    ///           "templateId": "pyth_btcusd",
+    ///           "values": {
+    ///             "price_message.price_value": 67500
+    ///           },
+    ///           "scenarioRelativeSlot": 100,
+    ///           "label": "Set BTC price",
+    ///           "enabled": true,
+    ///           "fetchBeforeUse": true,
+    ///           "account": {
+    ///             "pubkey": "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4QJNYH"
+    ///           }
+    ///         }
+    ///       ],
+    ///       "tags": []
+    ///     }
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// ## Example Response
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "context": {
+    ///     "slot": 355684457,
+    ///     "apiVersion": "2.2.2"
+    ///   },
+    ///   "value": null,
+    ///   "id": 1
+    /// }
+    /// ```
+    #[rpc(meta, name = "surfnet_registerScenario")]
+    fn register_scenario(
+        &self,
+        meta: Self::Metadata,
+        scenario: Scenario,
+        slot: Option<Slot>,
+    ) -> Result<RpcResponse<()>>;
 }
 
 #[derive(Clone)]
@@ -890,12 +1219,15 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             Err(e) => return e.into(),
         };
 
+        let is_native_mint = mint == spl_token_interface::native_mint::id();
+        let token_amount = update.amount.unwrap_or(0);
+
         let token_program_id = match some_token_program_str {
             Some(token_program_str) => match verify_pubkey(&token_program_str) {
                 Ok(res) => res,
                 Err(e) => return e.into(),
             },
-            None => spl_token::id(),
+            None => spl_token_interface::id(),
         };
 
         let associated_token_account =
@@ -916,6 +1248,19 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 .inner;
             svm_locker.write_account_update(get_mint_result);
 
+            let minimum_rent = svm_locker.with_svm_reader(|svm_reader| {
+                svm_reader.inner.minimum_balance_for_rent_exemption(
+                    TokenAccount::get_packed_len_for_token_program_id(&token_program_id),
+                )
+            });
+
+            let (rent_exempt_reserve, initial_lamports) = if is_native_mint {
+                // For native mint, we need to allocate enough lamports to cover the wrapped SOL amount
+                (Some(minimum_rent), minimum_rent + token_amount) // 1 SOL wrapped
+            } else {
+                (None, minimum_rent)
+            };
+
             let SvmAccessContext {
                 slot,
                 inner: mut token_account,
@@ -924,21 +1269,14 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 .get_account(
                     &remote_ctx,
                     &associated_token_account,
-                    Some(Box::new(move |svm_locker| {
-                        let minimum_rent = svm_locker.with_svm_reader(|svm_reader| {
-                            svm_reader.inner.minimum_balance_for_rent_exemption(
-                                TokenAccount::get_packed_len_for_token_program_id(
-                                    &token_program_id,
-                                ),
-                            )
-                        });
-
-                        let default = TokenAccount::new(&token_program_id, owner, mint);
+                    Some(Box::new(move |_| {
+                        let default =
+                            TokenAccount::new(&token_program_id, owner, mint, rent_exempt_reserve);
                         let data = default.pack_into_vec();
                         GetAccountResult::FoundAccount(
                             associated_token_account,
                             Account {
-                                lamports: minimum_rent,
+                                lamports: initial_lamports,
                                 owner: token_program_id,
                                 executable: false,
                                 rent_epoch: 0,
@@ -959,6 +1297,8 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
 
             let final_account_bytes = token_account_data.pack_into_vec();
             token_account.apply_update(|account| {
+                // If this is a native mint, we need to adjust the lamports to match the wrapped SOL amount + rent
+                account.lamports = initial_lamports;
                 account.data = final_account_bytes.clone();
                 Ok(())
             })?;
@@ -1163,7 +1503,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
     ) -> Result<RpcResponse<Option<UiKeyedProfileResult>>> {
         let config = config.unwrap_or_default();
         let svm_locker = meta.get_svm_locker()?;
-        let profile_result = svm_locker.get_profile_result(signature_or_uuid.clone(), &config)?;
+        let profile_result = svm_locker.get_profile_result(signature_or_uuid, &config)?;
         let context_slot = profile_result
             .as_ref()
             .map(|pr| pr.slot)
@@ -1184,7 +1524,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             Ok(locker) => locker,
             Err(e) => return Err(e.into()),
         };
-        svm_locker.register_idl(idl, slot);
+        svm_locker.register_idl(idl, slot)?;
         Ok(RpcResponse {
             context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
             value: (),
@@ -1223,7 +1563,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             Err(e) => return e.into(),
         };
 
-        let limit = limit.unwrap_or_else(|| 50);
+        let limit = limit.unwrap_or(50);
         let latest = svm_locker.get_latest_absolute_slot();
         if limit == 0 {
             return Box::pin(async move {
@@ -1242,21 +1582,24 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         )> = svm_locker.with_svm_reader(|svm_reader| {
             svm_reader
                 .transactions
-                .iter()
-                .map(|(sig, status)| {
-                    let (transaction_with_status_meta, _) = status.expect_processed();
-                    (
-                        sig.to_string(),
-                        transaction_with_status_meta.slot,
-                        transaction_with_status_meta.meta.status.clone().err(),
-                        transaction_with_status_meta
-                            .meta
-                            .log_messages
-                            .clone()
-                            .unwrap_or_default(),
-                    )
+                .into_iter()
+                .map(|iter| {
+                    iter.map(|(sig, status)| {
+                        let (transaction_with_status_meta, _) = status.expect_processed();
+                        (
+                            sig,
+                            transaction_with_status_meta.slot,
+                            transaction_with_status_meta.meta.status.clone().err(),
+                            transaction_with_status_meta
+                                .meta
+                                .log_messages
+                                .clone()
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect()
                 })
-                .collect()
+                .unwrap_or_default()
         });
 
         items.sort_by(|a, b| b.1.cmp(&a.1));
@@ -1266,7 +1609,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             .into_iter()
             .map(|(signature, _slot, err, logs)| RpcLogsResponse {
                 signature,
-                err,
+                err: err.map(|e| e.into()),
                 logs,
             })
             .collect();
@@ -1283,9 +1626,24 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         let key = meta.as_ref().map(|ctx| ctx.id.clone()).unwrap_or_default();
         let surfnet_command_tx: crossbeam_channel::Sender<SimnetCommand> =
             meta.get_surfnet_command_tx()?;
-        let _ = surfnet_command_tx.send(SimnetCommand::CommandClock(key, ClockCommand::Pause));
-        meta.with_svm_reader(|svm_reader| svm_reader.latest_epoch_info.clone())
-            .map_err(Into::into)
+
+        // Create a channel to receive confirmation
+        let (response_tx, response_rx) = crossbeam_channel::bounded(1);
+
+        // Send pause command with confirmation
+        let _ = surfnet_command_tx.send(SimnetCommand::CommandClock(
+            key,
+            ClockCommand::PauseWithConfirmation(response_tx),
+        ));
+
+        // Wait for confirmation with timeout
+        response_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|e| jsonrpc_core::Error {
+                code: jsonrpc_core::ErrorCode::InternalError,
+                message: format!("Failed to confirm clock pause: {}", e),
+                data: None,
+            })
     }
 
     fn resume_clock(&self, meta: Self::Metadata) -> Result<EpochInfo> {
@@ -1320,10 +1678,71 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
     ) -> Result<RpcResponse<()>> {
         let svm_locker = meta.get_svm_locker()?;
         let pubkey = verify_pubkey(&pubkey)?;
-        svm_locker.reset_account(pubkey, config.unwrap_or_default())?;
+        let config = config.unwrap_or_default();
+        let include_owned_accounts = config.include_owned_accounts.unwrap_or_default();
+        svm_locker.reset_account(pubkey, include_owned_accounts)?;
         Ok(RpcResponse {
             context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
             value: (),
+        })
+    }
+
+    fn reset_network(&self, meta: Self::Metadata) -> BoxFuture<Result<RpcResponse<()>>> {
+        let SurfnetRpcContext {
+            svm_locker,
+            remote_ctx,
+        } = match meta.get_rpc_context(CommitmentConfig::confirmed()) {
+            Ok(res) => res,
+            Err(e) => return e.into(),
+        };
+
+        // Extract just the remote client from the tuple (ignore commitment config)
+        let remote_client = remote_ctx.as_ref().map(|(client, _)| client.clone());
+
+        Box::pin(async move {
+            svm_locker.reset_network(&remote_client).await?;
+            Ok(RpcResponse {
+                context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
+                value: (),
+            })
+        })
+    }
+
+    fn stream_account(
+        &self,
+        meta: Self::Metadata,
+        pubkey_str: String,
+        config: Option<StreamAccountConfig>,
+    ) -> Result<RpcResponse<()>> {
+        let svm_locker = meta.get_svm_locker()?;
+        let pubkey = verify_pubkey(&pubkey_str)?;
+        let config = config.unwrap_or_default();
+        let include_owned_accounts = config.include_owned_accounts.unwrap_or_default();
+        svm_locker.stream_account(pubkey, include_owned_accounts)?;
+        Ok(RpcResponse {
+            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
+            value: (),
+        })
+    }
+
+    fn get_streamed_accounts(
+        &self,
+        meta: Self::Metadata,
+    ) -> Result<RpcResponse<GetStreamedAccountsResponse>> {
+        let svm_locker = meta.get_svm_locker()?;
+
+        let value = svm_locker.with_svm_reader(|svm_reader| {
+            let accounts: Vec<_> = svm_reader
+                .streamed_accounts
+                .into_iter()
+                .map(|iter| iter.collect())
+                .unwrap_or_default();
+            GetStreamedAccountsResponse::from_iter(accounts)
+        });
+
+        Ok(RpcResponse {
+            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
+            value,
         })
     }
 
@@ -1338,6 +1757,97 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             value: GetSurfnetInfoResponse::new(runbook_executions),
         })
     }
+
+    fn write_program(
+        &self,
+        meta: Self::Metadata,
+        program_id_str: String,
+        data_hex: String,
+        offset: usize,
+        authority: Option<String>,
+    ) -> BoxFuture<Result<RpcResponse<()>>> {
+        // Validate program_id
+        let program_id = match verify_pubkey(&program_id_str) {
+            Ok(res) => res,
+            Err(e) => return e.into(),
+        };
+
+        let authority = if let Some(ref authority_str) = authority {
+            match verify_pubkey(authority_str) {
+                Ok(res) => Some(res),
+                Err(e) => return e.into(),
+            }
+        } else {
+            None
+        };
+
+        // Decode hex data
+        let data = match hex::decode(&data_hex) {
+            Ok(data) => data,
+            Err(e) => {
+                return Box::pin(future::err(Error::invalid_params(format!(
+                    "Invalid hex data provided: {}",
+                    e
+                ))));
+            }
+        };
+
+        // Validate offset doesn't cause overflow
+        if offset.checked_add(data.len()).is_none() {
+            return Box::pin(future::err(Error::invalid_params(
+                "Offset + data length causes integer overflow",
+            )));
+        }
+
+        let SurfnetRpcContext {
+            svm_locker,
+            remote_ctx,
+        } = match meta.get_rpc_context(CommitmentConfig::confirmed()) {
+            Ok(res) => res,
+            Err(e) => return e.into(),
+        };
+
+        Box::pin(async move {
+            let slot = svm_locker.get_latest_absolute_slot();
+
+            svm_locker
+                .write_program(program_id, authority, offset, &data, &remote_ctx)
+                .await?;
+
+            Ok(RpcResponse {
+                context: RpcResponseContext::new(slot),
+                value: (),
+            })
+        })
+    }
+
+    fn export_snapshot(
+        &self,
+        meta: Self::Metadata,
+        config: Option<ExportSnapshotConfig>,
+    ) -> Result<RpcResponse<BTreeMap<String, AccountSnapshot>>> {
+        let config = config.unwrap_or_default();
+        let svm_locker = meta.get_svm_locker()?;
+        let snapshot = svm_locker.export_snapshot(config)?;
+        Ok(RpcResponse {
+            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
+            value: snapshot,
+        })
+    }
+
+    fn register_scenario(
+        &self,
+        meta: Self::Metadata,
+        scenario: Scenario,
+        slot: Option<Slot>,
+    ) -> Result<RpcResponse<()>> {
+        let svm_locker = meta.get_svm_locker()?;
+        svm_locker.register_scenario(scenario, slot)?;
+        Ok(RpcResponse {
+            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
+            value: (),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1347,15 +1857,20 @@ mod tests {
     };
     use solana_keypair::Keypair;
     use solana_program_pack::Pack;
+    use solana_pubkey::Pubkey;
     use solana_signer::Signer;
     use solana_system_interface::instruction::create_account;
     use solana_transaction::Transaction;
-    use spl_associated_token_account::{
-        get_associated_token_address_with_program_id, instruction::create_associated_token_account,
+    use spl_associated_token_account_interface::{
+        address::get_associated_token_address_with_program_id,
+        instruction::create_associated_token_account,
     };
-    use spl_token::state::Mint;
-    use spl_token_2022::instruction::{initialize_mint2, mint_to, transfer_checked};
-    use surfpool_types::{RpcProfileDepth, UiAccountChange, UiAccountProfileState};
+    use spl_token_2022_interface::instruction::{initialize_mint2, mint_to, transfer_checked};
+    use spl_token_interface::state::Mint;
+    use surfpool_types::{
+        ExportSnapshotFilter, ExportSnapshotScope, RpcProfileDepth, UiAccountChange,
+        UiAccountProfileState,
+    };
 
     use super::*;
     use crate::{rpc::surfnet_cheatcodes::SurfnetCheatcodesRpc, tests::helpers::TestSetup};
@@ -1382,6 +1897,7 @@ mod tests {
             .context
             .svm_locker
             .airdrop(&payer.pubkey(), 1_000_000_000)
+            .unwrap()
             .unwrap();
 
         // Airdrop 1 SOL to recipient for rent exemption
@@ -1389,6 +1905,7 @@ mod tests {
             .context
             .svm_locker
             .airdrop(&recipient.pubkey(), 1_000_000_000)
+            .unwrap()
             .unwrap();
 
         // Generate keypair to use as address of mint
@@ -1404,16 +1921,16 @@ mod tests {
 
         // Instruction to create new account for mint (token 2022 program)
         let create_account_instruction = create_account(
-            &payer.pubkey(),       // payer
-            &mint.pubkey(),        // new account (mint)
-            mint_rent,             // lamports
-            mint_space as u64,     // space
-            &spl_token_2022::id(), // program id
+            &payer.pubkey(),                 // payer
+            &mint.pubkey(),                  // new account (mint)
+            mint_rent,                       // lamports
+            mint_space as u64,               // space
+            &spl_token_2022_interface::id(), // program id
         );
 
         // Instruction to initialize mint account data
         let initialize_mint_instruction = initialize_mint2(
-            &spl_token_2022::id(),
+            &spl_token_2022_interface::id(),
             &mint.pubkey(),        // mint
             &payer.pubkey(),       // mint authority
             Some(&payer.pubkey()), // freeze authority
@@ -1423,40 +1940,40 @@ mod tests {
 
         // Calculate the associated token account address for fee_payer
         let source_ata = get_associated_token_address_with_program_id(
-            &owner.pubkey(),       // owner
-            &mint.pubkey(),        // mint
-            &spl_token_2022::id(), // program_id
+            &owner.pubkey(),                 // owner
+            &mint.pubkey(),                  // mint
+            &spl_token_2022_interface::id(), // program_id
         );
 
         // Instruction to create associated token account for fee_payer
         let create_source_ata_instruction = create_associated_token_account(
-            &payer.pubkey(),       // funding address
-            &owner.pubkey(),       // wallet address
-            &mint.pubkey(),        // mint address
-            &spl_token_2022::id(), // program id
+            &payer.pubkey(),                 // funding address
+            &owner.pubkey(),                 // wallet address
+            &mint.pubkey(),                  // mint address
+            &spl_token_2022_interface::id(), // program id
         );
 
         // Calculate the associated token account address for recipient
         let destination_ata = get_associated_token_address_with_program_id(
-            &recipient.pubkey(),   // owner
-            &mint.pubkey(),        // mint
-            &spl_token_2022::id(), // program_id
+            &recipient.pubkey(),             // owner
+            &mint.pubkey(),                  // mint
+            &spl_token_2022_interface::id(), // program_id
         );
 
         // Instruction to create associated token account for recipient
         let create_destination_ata_instruction = create_associated_token_account(
-            &payer.pubkey(),       // funding address
-            &recipient.pubkey(),   // wallet address
-            &mint.pubkey(),        // mint address
-            &spl_token_2022::id(), // program id
+            &payer.pubkey(),                 // funding address
+            &recipient.pubkey(),             // wallet address
+            &mint.pubkey(),                  // mint address
+            &spl_token_2022_interface::id(), // program id
         );
 
         // Amount of tokens to mint (100 tokens with 2 decimal places)
-        let amount = 100_00;
+        let amount = 10_000;
 
         // Create mint_to instruction to mint tokens to the source token account
         let mint_to_instruction = mint_to(
-            &spl_token_2022::id(),
+            &spl_token_2022_interface::id(),
             &mint.pubkey(),     // mint
             &source_ata,        // destination
             &payer.pubkey(),    // authority
@@ -1511,7 +2028,7 @@ mod tests {
                     .instruction_profiles
                     .as_ref()
                     .unwrap()
-                    .get(0)
+                    .first()
                     .expect("instruction profile should exist");
                 assert!(
                     ix_profile.error_message.is_none(),
@@ -1556,7 +2073,7 @@ mod tests {
                         );
                         assert_eq!(
                             mint_account.owner,
-                            spl_token_2022::id().to_string(),
+                            spl_token_2022_interface::id().to_string(),
                             "Mint account should be owned by the SPL Token program"
                         );
                         // initialized account data should be empty bytes
@@ -1588,7 +2105,7 @@ mod tests {
                     "Profile should succeed, found error: {}",
                     ix_profile.error_message.as_ref().unwrap()
                 );
-                assert_eq!(ix_profile.compute_units_consumed, 1031);
+                assert_eq!(ix_profile.compute_units_consumed, 1230);
                 let account_states = &ix_profile.account_states;
 
                 assert!(account_states.get(&payer.pubkey()).is_none());
@@ -1607,7 +2124,7 @@ mod tests {
                         );
                         assert_eq!(
                             after.owner,
-                            spl_token_2022::id().to_string(),
+                            spl_token_2022_interface::id().to_string(),
                             "Mint account should be owned by the SPL Token program"
                         );
                         // initialized account data should be empty bytes
@@ -1701,7 +2218,7 @@ mod tests {
                         );
                         assert_eq!(
                             new.owner,
-                            spl_token_2022::id().to_string(),
+                            spl_token_2022_interface::id().to_string(),
                             "Source ATA should be owned by the SPL Token program"
                         );
 
@@ -1810,7 +2327,7 @@ mod tests {
                         );
                         assert_eq!(
                             new.owner,
-                            spl_token_2022::id().to_string(),
+                            spl_token_2022_interface::id().to_string(),
                             "Source ATA should be owned by the SPL Token program"
                         );
                         match &new.data {
@@ -1943,7 +2460,7 @@ mod tests {
 
         // Create transfer_checked instruction to send tokens from source to destination
         let transfer_instruction = transfer_checked(
-            &spl_token_2022::id(),               // program id
+            &spl_token_2022_interface::id(),     // program id
             &source_ata,                         // source
             &mint.pubkey(),                      // mint
             &destination_ata,                    // destination
@@ -2005,7 +2522,7 @@ mod tests {
                 .instruction_profiles
                 .as_ref()
                 .unwrap()
-                .get(0)
+                .first()
                 .expect("instruction profile should exist");
             assert!(
                 ix_profile.error_message.is_none(),
@@ -2053,7 +2570,7 @@ mod tests {
                 panic!("Expected mint account state to be Readonly");
             };
             let UiAccountProfileState::Readonly = account_states
-                .swap_remove(&spl_token_2022::ID)
+                .swap_remove(&spl_token_2022_interface::ID)
                 .expect("account state should be present")
             else {
                 panic!("Expected account state to be Readonly");
@@ -2159,5 +2676,1312 @@ mod tests {
                 account_states
             );
         }
+    }
+
+    fn set_account(client: &TestSetup<SurfnetCheatcodesRpc>, pubkey: &Pubkey, account: &Account) {
+        client
+            .context
+            .svm_locker
+            .with_svm_writer(|svm| svm.inner.set_account(*pubkey, account.clone()))
+            .expect("Failed to set account");
+    }
+
+    fn verify_snapshot_account(
+        snapshot: &BTreeMap<String, AccountSnapshot>,
+        expected_account_pubkey: &Pubkey,
+        expected_account: &Account,
+    ) {
+        let account = snapshot
+            .get(&expected_account_pubkey.to_string())
+            .unwrap_or_else(|| {
+                panic!(
+                    "Account fixture not found for pubkey {}",
+                    expected_account_pubkey
+                )
+            });
+        assert_eq!(expected_account.lamports, account.lamports);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.encode(&expected_account.data),
+            account.data
+        );
+        assert_eq!(expected_account.owner.to_string(), account.owner);
+        assert_eq!(expected_account.executable, account.executable);
+        assert_eq!(expected_account.rent_epoch, account.rent_epoch);
+    }
+
+    #[test]
+    fn test_export_snapshot() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+
+        let pubkey1 = Pubkey::new_unique();
+        let account1 = Account {
+            lamports: 1_000_000,
+            data: vec![1, 2, 3, 4],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+
+        set_account(&client, &pubkey1, &account1);
+
+        let pubkey2 = Pubkey::new_unique();
+        let account2 = Account {
+            lamports: 2_000_000,
+            data: vec![5, 6, 7, 8, 9],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+
+        set_account(&client, &pubkey2, &account2);
+
+        let snapshot = client
+            .rpc
+            .export_snapshot(Some(client.context.clone()), None)
+            .expect("Failed to export snapshot")
+            .value;
+
+        verify_snapshot_account(&snapshot, &pubkey1, &account1);
+        verify_snapshot_account(&snapshot, &pubkey2, &account2);
+    }
+
+    #[test]
+    fn test_export_snapshot_json_parsed() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+
+        let pubkey1 = Pubkey::new_unique();
+        println!("Pubkey1: {}", pubkey1);
+        let account1 = Account {
+            lamports: 1_000_000,
+            data: vec![1, 2, 3, 4],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+
+        set_account(&client, &pubkey1, &account1);
+
+        let mint_pubkey = Pubkey::new_unique();
+        println!("Mint Pubkey: {}", mint_pubkey);
+        let mint_authority = Pubkey::new_unique();
+
+        let mut mint_data = [0u8; Mint::LEN];
+        let mint = Mint {
+            mint_authority: COption::Some(mint_authority),
+            supply: 1000,
+            decimals: 6,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        };
+        mint.pack_into_slice(&mut mint_data);
+
+        let mint_account = Account {
+            lamports: 1_000_000,
+            data: mint_data.to_vec(),
+            owner: spl_token_interface::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+
+        set_account(&client, &mint_pubkey, &mint_account);
+
+        let snapshot = client
+            .rpc
+            .export_snapshot(
+                Some(client.context.clone()),
+                Some(ExportSnapshotConfig {
+                    include_parsed_accounts: Some(true),
+                    filter: None,
+                    scope: ExportSnapshotScope::Network,
+                }),
+            )
+            .expect("Failed to export snapshot")
+            .value;
+
+        verify_snapshot_account(&snapshot, &pubkey1, &account1);
+        let actual_account1 = snapshot
+            .get(&pubkey1.to_string())
+            .expect("Account fixture not found");
+        assert!(
+            actual_account1.parsed_data.is_none(),
+            "Account1 should not have parsed data"
+        );
+
+        verify_snapshot_account(&snapshot, &mint_pubkey, &mint_account);
+        let mint_snapshot = snapshot
+            .get(&mint_pubkey.to_string())
+            .expect("Mint account snapshot not found");
+        let parsed = mint_snapshot
+            .parsed_data
+            .as_ref()
+            .expect("Parsed data should be present");
+
+        assert_eq!(parsed.program, "spl-token");
+        assert_eq!(parsed.space, Mint::LEN as u64);
+
+        let parsed_info = parsed
+            .parsed
+            .as_object()
+            .expect("Parsed data should be an object");
+        let info = parsed_info
+            .get("info")
+            .expect("Parsed data should have info field")
+            .as_object()
+            .expect("Info field should be an object");
+        assert_eq!(
+            info.get("mintAuthority")
+                .and_then(|v| v.as_str())
+                .expect("mintAuthority should be a string"),
+            mint_authority.to_string()
+        );
+    }
+
+    #[test]
+    fn test_export_snapshot_pre_transaction() {
+        use std::collections::HashMap;
+
+        use solana_signature::Signature;
+        use surfpool_types::{ProfileResult, types::KeyedProfileResult};
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+
+        // Create several accounts in the network
+        let account1_pubkey = Pubkey::new_unique();
+        let account1 = Account {
+            lamports: 1_000_000,
+            data: vec![1, 2, 3, 4],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        set_account(&client, &account1_pubkey, &account1);
+
+        let account2_pubkey = Pubkey::new_unique();
+        let account2 = Account {
+            lamports: 2_000_000,
+            data: vec![5, 6, 7, 8],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        set_account(&client, &account2_pubkey, &account2);
+
+        let account3_pubkey = Pubkey::new_unique();
+        let account3 = Account {
+            lamports: 3_000_000,
+            data: vec![9, 10, 11, 12],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        set_account(&client, &account3_pubkey, &account3);
+
+        // Create a mock transaction profile that only touches account1 and account2
+        let signature = Signature::new_unique();
+        let mut pre_execution_capture = BTreeMap::new();
+        pre_execution_capture.insert(account1_pubkey, Some(account1.clone()));
+        pre_execution_capture.insert(account2_pubkey, Some(account2.clone()));
+
+        let mut post_execution_capture = BTreeMap::new();
+        let mut modified_account1 = account1.clone();
+        modified_account1.lamports = 500_000;
+        post_execution_capture.insert(account1_pubkey, Some(modified_account1.clone()));
+        let mut modified_account2 = account2.clone();
+        modified_account2.lamports = 2_500_000;
+        post_execution_capture.insert(account2_pubkey, Some(modified_account2.clone()));
+
+        let profile = ProfileResult {
+            pre_execution_capture,
+            post_execution_capture,
+            compute_units_consumed: 1000,
+            log_messages: None,
+            error_message: None,
+        };
+
+        let keyed_profile = KeyedProfileResult::new(
+            1,
+            UuidOrSignature::Signature(signature),
+            None,
+            profile,
+            HashMap::new(),
+        );
+
+        // Insert the profile into executed_transaction_profiles
+        client.context.svm_locker.with_svm_writer(|svm| {
+            svm.executed_transaction_profiles
+                .store(signature.to_string(), keyed_profile)
+                .unwrap();
+        });
+
+        // Export snapshot with PreTransaction scope
+        let snapshot = client
+            .rpc
+            .export_snapshot(
+                Some(client.context.clone()),
+                Some(ExportSnapshotConfig {
+                    include_parsed_accounts: Some(false),
+                    filter: None,
+                    scope: ExportSnapshotScope::PreTransaction(signature.to_string()),
+                }),
+            )
+            .expect("Failed to export snapshot")
+            .value;
+
+        // Verify that only account1 and account2 are in the snapshot
+        assert!(
+            snapshot.contains_key(&account1_pubkey.to_string()),
+            "Snapshot should contain account1 (touched by transaction)"
+        );
+        assert!(
+            snapshot.contains_key(&account2_pubkey.to_string()),
+            "Snapshot should contain account2 (touched by transaction)"
+        );
+        assert!(
+            !snapshot.contains_key(&account3_pubkey.to_string()),
+            "Snapshot should NOT contain account3 (not touched by transaction)"
+        );
+
+        // Verify the accounts have the PRE-EXECUTION state (original values, not modified)
+        verify_snapshot_account(&snapshot, &account1_pubkey, &account1);
+        verify_snapshot_account(&snapshot, &account2_pubkey, &account2);
+
+        // Double-check that we're NOT getting the post-execution values
+        let snapshot_account1 = snapshot
+            .get(&account1_pubkey.to_string())
+            .expect("Account1 should be in snapshot");
+        assert_eq!(
+            snapshot_account1.lamports, 1_000_000,
+            "Account1 should have pre-execution lamports (1M), not post-execution (500K)"
+        );
+
+        let snapshot_account2 = snapshot
+            .get(&account2_pubkey.to_string())
+            .expect("Account2 should be in snapshot");
+        assert_eq!(
+            snapshot_account2.lamports, 2_000_000,
+            "Account2 should have pre-execution lamports (2M), not post-execution (2.5M)"
+        );
+
+        // Verify account count
+        // Note: The snapshot may contain more accounts if system accounts are included
+        // but we verify that at least our touched accounts are there and untouched ones are not
+        println!(
+            "Snapshot contains {} accounts (expected at least 2)",
+            snapshot.len()
+        );
+    }
+
+    #[test]
+    fn test_export_snapshot_filtering() {
+        let system_account_pubkey = Pubkey::new_unique();
+        println!("System Account Pubkey: {}", system_account_pubkey);
+        let excluded_system_account_pubkey = Pubkey::new_unique();
+        println!(
+            "Excluded System Account Pubkey: {}",
+            excluded_system_account_pubkey
+        );
+        let program_account_pubkey = Pubkey::new_unique();
+        println!("Program Account Pubkey: {}", program_account_pubkey);
+        let included_program_account_pubkey = Pubkey::new_unique();
+        println!(
+            "Included Program Account Pubkey: {}",
+            included_program_account_pubkey
+        );
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+
+        let system_account = Account {
+            lamports: 1_000_000,
+            data: vec![1, 2, 3, 4],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        set_account(&client, &system_account_pubkey, &system_account);
+        set_account(&client, &excluded_system_account_pubkey, &system_account);
+
+        let program_account = Account {
+            lamports: 2_000_000,
+            data: vec![5, 6, 7, 8, 9],
+            owner: solana_sdk_ids::bpf_loader_upgradeable::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        set_account(&client, &program_account_pubkey, &program_account);
+        set_account(&client, &included_program_account_pubkey, &program_account);
+
+        let snapshot = client
+            .rpc
+            .export_snapshot(Some(client.context.clone()), None)
+            .expect("Failed to export snapshot")
+            .value;
+        assert!(
+            !snapshot.contains_key(&program_account_pubkey.to_string()),
+            "Program account should be excluded by default"
+        );
+        assert!(
+            !snapshot.contains_key(&included_program_account_pubkey.to_string()),
+            "Program account should be excluded by default"
+        );
+        let snapshot = client
+            .rpc
+            .export_snapshot(
+                Some(client.context.clone()),
+                Some(ExportSnapshotConfig {
+                    filter: Some(ExportSnapshotFilter {
+                        include_accounts: Some(vec![included_program_account_pubkey.to_string()]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .expect("Failed to export snapshot")
+            .value;
+        assert!(
+            !snapshot.contains_key(&program_account_pubkey.to_string()),
+            "Program account should be excluded by default"
+        );
+        assert!(
+            snapshot.contains_key(&included_program_account_pubkey.to_string()),
+            "Program account should be included when explicitly listed"
+        );
+
+        let snapshot = client
+            .rpc
+            .export_snapshot(
+                Some(client.context.clone()),
+                Some(ExportSnapshotConfig {
+                    filter: Some(ExportSnapshotFilter {
+                        include_program_accounts: Some(true),
+                        exclude_accounts: Some(vec![excluded_system_account_pubkey.to_string()]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .expect("Failed to export snapshot")
+            .value;
+
+        assert!(
+            snapshot.contains_key(&program_account_pubkey.to_string()),
+            "Program account should be included when filter is set"
+        );
+        assert!(
+            snapshot.contains_key(&included_program_account_pubkey.to_string()),
+            "Included program account should be present"
+        );
+        assert!(
+            snapshot.contains_key(&system_account_pubkey.to_string()),
+            "System account should be present"
+        );
+        assert!(
+            !snapshot.contains_key(&excluded_system_account_pubkey.to_string()),
+            "Excluded system account should not be present"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_program_creates_accounts_automatically() {
+        // Test that both program and program data accounts are created if they don't exist
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+        let program_id = Keypair::new();
+
+        // Verify accounts don't exist initially
+        let program_data_address =
+            solana_loader_v3_interface::get_program_data_address(&program_id.pubkey());
+
+        let program_account_before = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader.inner.get_account(&program_id.pubkey()).unwrap()
+        });
+        assert!(
+            program_account_before.is_none(),
+            "Program account should not exist initially"
+        );
+
+        // Write some data
+        let program_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let result = client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                program_id.pubkey().to_string(),
+                hex::encode(&program_data),
+                0,
+                None,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Failed to write program: {:?}",
+            result.err()
+        );
+
+        // Verify program account was created
+        let program_account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader.inner.get_account(&program_id.pubkey()).unwrap()
+        });
+        assert!(
+            program_account.is_some(),
+            "Program account should be created"
+        );
+
+        let program_account = program_account.unwrap();
+        assert_eq!(
+            program_account.owner,
+            solana_sdk_ids::bpf_loader_upgradeable::id()
+        );
+        assert!(
+            program_account.executable,
+            "Program account should be executable"
+        );
+
+        // Verify program data account was created
+        let program_data_account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader.inner.get_account(&program_data_address).unwrap()
+        });
+        assert!(
+            program_data_account.is_some(),
+            "Program data account should be created"
+        );
+
+        let program_data_account = program_data_account.unwrap();
+        assert_eq!(
+            program_data_account.owner,
+            solana_sdk_ids::bpf_loader_upgradeable::id()
+        );
+        assert!(
+            !program_data_account.executable,
+            "Program data account should not be executable"
+        );
+
+        println!("✅ Both accounts created successfully");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_program_single_chunk_small() {
+        // Test writing a small program in a single write
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+        let program_id = Keypair::new();
+
+        let program_data = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+        let data_hex = hex::encode(&program_data);
+
+        let result = client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                program_id.pubkey().to_string(),
+                data_hex,
+                0,
+                None,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Failed to write program: {:?}",
+            result.err()
+        );
+
+        // Verify the data was written correctly
+        let program_data_address =
+            solana_loader_v3_interface::get_program_data_address(&program_id.pubkey());
+        let account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&program_data_address)
+                .unwrap()
+                .unwrap()
+        });
+
+        let metadata_size =
+            solana_loader_v3_interface::state::UpgradeableLoaderState::size_of_programdata_metadata(
+            );
+        let written_data = &account.data[metadata_size..metadata_size + program_data.len()];
+        assert_eq!(
+            written_data, &program_data,
+            "Written data should match input"
+        );
+
+        println!("✅ Small program written correctly");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_program_single_chunk_large() {
+        // Test writing a large program (1MB) in a single write
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+        let program_id = Keypair::new();
+
+        let program_data = vec![0xAB; 1024 * 1024]; // 1 MB
+        let data_hex = hex::encode(&program_data);
+
+        let result = client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                program_id.pubkey().to_string(),
+                data_hex,
+                0,
+                None,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Failed to write large program: {:?}",
+            result.err()
+        );
+
+        // Verify the data was written
+        let program_data_address =
+            solana_loader_v3_interface::get_program_data_address(&program_id.pubkey());
+        let account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&program_data_address)
+                .unwrap()
+                .unwrap()
+        });
+
+        let metadata_size =
+            solana_loader_v3_interface::state::UpgradeableLoaderState::size_of_programdata_metadata(
+            );
+        assert_eq!(
+            account.data.len(),
+            metadata_size + program_data.len(),
+            "Account should have correct size"
+        );
+
+        println!("✅ Large program (1MB) written successfully");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_program_multiple_sequential_chunks() {
+        // Test writing a program in multiple sequential chunks
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+        let program_id = Keypair::new();
+
+        let chunks = vec![
+            (vec![0x01; 1024], 0),    // First 1KB at offset 0
+            (vec![0x02; 1024], 1024), // Second 1KB at offset 1024
+            (vec![0x03; 1024], 2048), // Third 1KB at offset 2048
+            (vec![0x04; 512], 3072),  // Last 512 bytes at offset 3072
+        ];
+
+        for (i, (chunk_data, offset)) in chunks.iter().enumerate() {
+            let result = client
+                .rpc
+                .write_program(
+                    Some(client.context.clone()),
+                    program_id.pubkey().to_string(),
+                    hex::encode(chunk_data),
+                    *offset,
+                    None,
+                )
+                .await;
+
+            assert!(
+                result.is_ok(),
+                "Failed to write chunk {} at offset {}: {:?}",
+                i,
+                offset,
+                result.err()
+            );
+        }
+
+        // Verify all chunks were written correctly
+        let program_data_address =
+            solana_loader_v3_interface::get_program_data_address(&program_id.pubkey());
+        let account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&program_data_address)
+                .unwrap()
+                .unwrap()
+        });
+
+        let metadata_size =
+            solana_loader_v3_interface::state::UpgradeableLoaderState::size_of_programdata_metadata(
+            );
+
+        // Verify each chunk
+        for (chunk_data, offset) in chunks {
+            let start = metadata_size + offset as usize;
+            let end = start + chunk_data.len();
+            let written = &account.data[start..end];
+            assert_eq!(
+                written,
+                &chunk_data[..],
+                "Chunk at offset {} should match",
+                offset
+            );
+        }
+
+        println!("✅ Multiple sequential chunks written correctly");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_program_non_sequential_chunks() {
+        // Test writing chunks out of order (backwards)
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+        let program_id = Keypair::new();
+
+        let chunks = vec![
+            (vec![0x03; 512], 2048),  // Write third chunk first
+            (vec![0x01; 1024], 0),    // Write first chunk second
+            (vec![0x02; 1024], 1024), // Write second chunk last
+        ];
+
+        for (chunk_data, offset) in chunks.iter() {
+            let result = client
+                .rpc
+                .write_program(
+                    Some(client.context.clone()),
+                    program_id.pubkey().to_string(),
+                    hex::encode(chunk_data),
+                    *offset,
+                    None,
+                )
+                .await;
+
+            assert!(
+                result.is_ok(),
+                "Failed at offset {}: {:?}",
+                offset,
+                result.err()
+            );
+        }
+
+        // Verify data integrity
+        let program_data_address =
+            solana_loader_v3_interface::get_program_data_address(&program_id.pubkey());
+        let account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&program_data_address)
+                .unwrap()
+                .unwrap()
+        });
+
+        let metadata_size =
+            solana_loader_v3_interface::state::UpgradeableLoaderState::size_of_programdata_metadata(
+            );
+
+        // Check first chunk
+        assert_eq!(
+            &account.data[metadata_size..metadata_size + 1024],
+            &vec![0x01; 1024][..]
+        );
+        // Check second chunk
+        assert_eq!(
+            &account.data[metadata_size + 1024..metadata_size + 2048],
+            &vec![0x02; 1024][..]
+        );
+        // Check third chunk
+        assert_eq!(
+            &account.data[metadata_size + 2048..metadata_size + 2560],
+            &vec![0x03; 512][..]
+        );
+
+        println!("✅ Non-sequential chunks written correctly");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_program_overlapping_writes() {
+        // Test that overlapping writes correctly overwrite previous data
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+        let program_id = Keypair::new();
+
+        // Write initial data
+        let initial_data = vec![0xFF; 1024];
+        client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                program_id.pubkey().to_string(),
+                hex::encode(&initial_data),
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Overwrite middle section
+        let overwrite_data = vec![0xAA; 512];
+        client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                program_id.pubkey().to_string(),
+                hex::encode(&overwrite_data),
+                256, // Start in the middle
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Verify the result
+        let program_data_address =
+            solana_loader_v3_interface::get_program_data_address(&program_id.pubkey());
+        let account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&program_data_address)
+                .unwrap()
+                .unwrap()
+        });
+
+        let metadata_size =
+            solana_loader_v3_interface::state::UpgradeableLoaderState::size_of_programdata_metadata(
+            );
+
+        // First 256 bytes should be 0xFF
+        assert_eq!(
+            &account.data[metadata_size..metadata_size + 256],
+            &vec![0xFF; 256][..]
+        );
+        // Middle 512 bytes should be 0xAA
+        assert_eq!(
+            &account.data[metadata_size + 256..metadata_size + 768],
+            &vec![0xAA; 512][..]
+        );
+        // Last 256 bytes should be 0xFF
+        assert_eq!(
+            &account.data[metadata_size + 768..metadata_size + 1024],
+            &vec![0xFF; 256][..]
+        );
+
+        println!("✅ Overlapping writes handled correctly");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_program_zero_offset() {
+        // Test writing at offset 0 (should write immediately after metadata)
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+        let program_id = Keypair::new();
+
+        let data = vec![0x42; 128];
+        let result = client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                program_id.pubkey().to_string(),
+                hex::encode(&data),
+                0,
+                None,
+            )
+            .await;
+
+        assert!(result.is_ok());
+
+        let program_data_address =
+            solana_loader_v3_interface::get_program_data_address(&program_id.pubkey());
+        let account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&program_data_address)
+                .unwrap()
+                .unwrap()
+        });
+
+        let metadata_size =
+            solana_loader_v3_interface::state::UpgradeableLoaderState::size_of_programdata_metadata(
+            );
+        assert_eq!(&account.data[metadata_size..metadata_size + 128], &data[..]);
+
+        println!("✅ Write at offset 0 works correctly");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_program_large_offset() {
+        // Test writing at a large offset (account should expand)
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+        let program_id = Keypair::new();
+
+        let large_offset = 1024 * 1024; // 1 MB offset
+        let data = vec![0x99; 256];
+
+        let result = client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                program_id.pubkey().to_string(),
+                hex::encode(&data),
+                large_offset,
+                None,
+            )
+            .await;
+
+        assert!(result.is_ok(), "Should handle large offset");
+
+        let program_data_address =
+            solana_loader_v3_interface::get_program_data_address(&program_id.pubkey());
+        let account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&program_data_address)
+                .unwrap()
+                .unwrap()
+        });
+
+        let metadata_size =
+            solana_loader_v3_interface::state::UpgradeableLoaderState::size_of_programdata_metadata(
+            );
+        let expected_size = metadata_size + large_offset as usize + data.len();
+        assert_eq!(
+            account.data.len(),
+            expected_size,
+            "Account should expand to fit data"
+        );
+
+        // Verify data at the large offset
+        let start = metadata_size + large_offset as usize;
+        assert_eq!(&account.data[start..start + 256], &data[..]);
+
+        println!("✅ Large offset handled with account expansion");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_program_empty_data() {
+        // Test writing empty data (should succeed but not write anything)
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+        let program_id = Keypair::new();
+
+        let result = client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                program_id.pubkey().to_string(),
+                hex::encode(&[]),
+                0,
+                None,
+            )
+            .await;
+
+        assert!(result.is_ok(), "Should handle empty data");
+
+        println!("✅ Empty data handled correctly");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_program_single_byte() {
+        // Test writing a single byte
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+        let program_id = Keypair::new();
+
+        let data = vec![0x42];
+        let result = client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                program_id.pubkey().to_string(),
+                hex::encode(&data),
+                0,
+                None,
+            )
+            .await;
+
+        assert!(result.is_ok());
+
+        let program_data_address =
+            solana_loader_v3_interface::get_program_data_address(&program_id.pubkey());
+        let account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&program_data_address)
+                .unwrap()
+                .unwrap()
+        });
+
+        let metadata_size =
+            solana_loader_v3_interface::state::UpgradeableLoaderState::size_of_programdata_metadata(
+            );
+        assert_eq!(account.data[metadata_size], 0x42);
+
+        println!("✅ Single byte write works");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_program_invalid_program_id() {
+        // Test with invalid program ID
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+
+        let result = client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                "not_a_valid_pubkey".to_string(),
+                "deadbeef".to_string(),
+                0,
+                None,
+            )
+            .await;
+
+        assert!(result.is_err(), "Should fail with invalid program ID");
+        assert!(
+            result.unwrap_err().to_string().contains("Invalid pubkey"),
+            "Error should mention invalid pubkey"
+        );
+
+        println!("✅ Invalid program ID rejected");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_program_invalid_hex_data() {
+        // Test with invalid hex encoding
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+        let program_id = Keypair::new();
+
+        let invalid_hex_strings = vec![
+            "not_hex_at_all",
+            "GHIJKLMN",
+            "0x123", // odd length
+            "12 34", // contains space
+        ];
+
+        for invalid_hex in invalid_hex_strings {
+            let result = client
+                .rpc
+                .write_program(
+                    Some(client.context.clone()),
+                    program_id.pubkey().to_string(),
+                    invalid_hex.to_string(),
+                    0,
+                    None,
+                )
+                .await;
+
+            assert!(
+                result.is_err(),
+                "Should fail with invalid hex: {}",
+                invalid_hex
+            );
+            assert!(
+                result.unwrap_err().to_string().contains("Invalid hex"),
+                "Error should mention invalid hex"
+            );
+        }
+
+        println!("✅ Invalid hex data rejected");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_program_rent_exemption() {
+        // Test that rent exemption is maintained when account expands
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+        let program_id = Keypair::new();
+
+        // Write initial small data
+        let small_data = vec![0x01; 128];
+        client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                program_id.pubkey().to_string(),
+                hex::encode(&small_data),
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let program_data_address =
+            solana_loader_v3_interface::get_program_data_address(&program_id.pubkey());
+
+        let initial_lamports = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&program_data_address)
+                .unwrap()
+                .unwrap()
+                .lamports
+        });
+
+        // Write at large offset to expand account
+        let large_data = vec![0x02; 1024];
+        client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                program_id.pubkey().to_string(),
+                hex::encode(&large_data),
+                10240, // Large offset
+                None,
+            )
+            .await
+            .unwrap();
+
+        let final_lamports = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&program_data_address)
+                .unwrap()
+                .unwrap()
+                .lamports
+        });
+
+        assert!(
+            final_lamports > initial_lamports,
+            "Lamports should increase to maintain rent exemption"
+        );
+
+        // Verify rent exemption
+        let account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&program_data_address)
+                .unwrap()
+                .unwrap()
+        });
+
+        let required_lamports = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .minimum_balance_for_rent_exemption(account.data.len())
+        });
+
+        assert_eq!(
+            account.lamports, required_lamports,
+            "Account should have exact rent-exempt lamports"
+        );
+
+        println!("✅ Rent exemption maintained during expansion");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_program_account_ownership() {
+        // Test that created accounts have correct ownership
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+        let program_id = Keypair::new();
+        let authority = Keypair::new();
+
+        let data = vec![0xAB; 64];
+        client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                program_id.pubkey().to_string(),
+                hex::encode(&data),
+                0,
+                Some(authority.pubkey().to_string()),
+            )
+            .await
+            .unwrap();
+
+        let program_data_address =
+            solana_loader_v3_interface::get_program_data_address(&program_id.pubkey());
+
+        // Check program account ownership
+        let program_account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&program_id.pubkey())
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(
+            program_account.owner,
+            solana_sdk_ids::bpf_loader_upgradeable::id(),
+            "Program account should be owned by upgradeable loader"
+        );
+        assert!(
+            program_account.executable,
+            "Program account should be executable"
+        );
+
+        // Check program data account ownership
+        let program_data_account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&program_data_address)
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(
+            program_data_account.owner,
+            solana_sdk_ids::bpf_loader_upgradeable::id(),
+            "Program data account should be owned by upgradeable loader"
+        );
+        assert!(
+            !program_data_account.executable,
+            "Program data account should not be executable"
+        );
+
+        // Check program authority
+
+        let Ok(solana_loader_v3_interface::state::UpgradeableLoaderState::ProgramData {
+            slot: _,
+            upgrade_authority_address,
+        }) = bincode::deserialize::<solana_loader_v3_interface::state::UpgradeableLoaderState>(
+            &program_data_account.data,
+        )
+        else {
+            panic!("Program data account has incorrect state");
+        };
+
+        assert_eq!(
+            upgrade_authority_address,
+            Some(authority.pubkey()),
+            "Upgrade authority should match"
+        );
+
+        println!("✅ Account ownership is correct");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_program_metadata_preservation() {
+        // Test that program data account metadata is preserved across writes
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+        let program_id = Keypair::new();
+
+        // First write
+        client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                program_id.pubkey().to_string(),
+                hex::encode(&vec![0x01; 128]),
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let program_data_address =
+            solana_loader_v3_interface::get_program_data_address(&program_id.pubkey());
+
+        // Get initial metadata
+        let initial_account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&program_data_address)
+                .unwrap()
+                .unwrap()
+        });
+
+        let metadata_size =
+            solana_loader_v3_interface::state::UpgradeableLoaderState::size_of_programdata_metadata(
+            );
+        let initial_metadata = initial_account.data[..metadata_size].to_vec();
+
+        // Second write (should preserve metadata)
+        client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                program_id.pubkey().to_string(),
+                hex::encode(&vec![0x02; 256]),
+                128,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Verify metadata is preserved
+        let final_account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&program_data_address)
+                .unwrap()
+                .unwrap()
+        });
+
+        let final_metadata = final_account.data[..metadata_size].to_vec();
+        assert_eq!(
+            initial_metadata, final_metadata,
+            "Metadata should be preserved"
+        );
+
+        println!("✅ Metadata preserved across writes");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_program_idempotent() {
+        // Test that writing the same data twice produces the same result
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+        let program_id = Keypair::new();
+
+        let data = vec![0x55; 512];
+        let offset = 100;
+
+        // First write
+        client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                program_id.pubkey().to_string(),
+                hex::encode(&data),
+                offset,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let program_data_address =
+            solana_loader_v3_interface::get_program_data_address(&program_id.pubkey());
+
+        let first_account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&program_data_address)
+                .unwrap()
+                .unwrap()
+        });
+
+        // Second write (same data, same offset)
+        client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                program_id.pubkey().to_string(),
+                hex::encode(&data),
+                offset,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let second_account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&program_data_address)
+                .unwrap()
+                .unwrap()
+        });
+
+        assert_eq!(
+            first_account.data, second_account.data,
+            "Data should be identical"
+        );
+        assert_eq!(
+            first_account.lamports, second_account.lamports,
+            "Lamports should be identical"
+        );
+
+        println!("✅ Writes are idempotent");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_program_context_slot() {
+        // Test that response context contains valid slot
+        let client = TestSetup::new(SurfnetCheatcodesRpc);
+        let program_id = Keypair::new();
+
+        let result = client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                program_id.pubkey().to_string(),
+                hex::encode(&vec![0x42; 64]),
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.context.slot > 0, "Context slot should be valid");
+
+        println!("✅ Response context is valid");
     }
 }

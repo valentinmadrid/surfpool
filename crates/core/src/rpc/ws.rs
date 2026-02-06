@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, RwLock, atomic},
 };
 
+use crossbeam_channel::TryRecvError;
 use jsonrpc_core::{Error, ErrorCode, Result};
 use jsonrpc_derive::rpc;
 use jsonrpc_pubsub::{
@@ -576,6 +577,212 @@ pub trait Rpc {
         meta: Option<Self::Metadata>,
         subscription: SubscriptionId,
     ) -> Result<bool>;
+
+    #[pubsub(subscription = "rootNotification", subscribe, name = "rootSubscribe")]
+    fn root_subscribe(&self, meta: Self::Metadata, subscriber: Subscriber<RpcResponse<()>>);
+
+    #[pubsub(
+        subscription = "rootNotification",
+        unsubscribe,
+        name = "rootUnsubscribe"
+    )]
+    fn root_unsubscribe(
+        &self,
+        meta: Option<Self::Metadata>,
+        subscription: SubscriptionId,
+    ) -> Result<bool>;
+
+    #[pubsub(
+        subscription = "programNotification",
+        subscribe,
+        name = "programSubscribe"
+    )]
+    fn program_subscribe(&self, meta: Self::Metadata, subscriber: Subscriber<RpcResponse<()>>);
+
+    #[pubsub(
+        subscription = "programNotification",
+        unsubscribe,
+        name = "ProgramUnsubscribe"
+    )]
+    fn program_unsubscribe(
+        &self,
+        meta: Option<Self::Metadata>,
+        subscription: SubscriptionId,
+    ) -> Result<bool>;
+
+    #[pubsub(
+        subscription = "slotsUpdatesNotification",
+        subscribe,
+        name = "slotsUpdatesSubscribe"
+    )]
+    fn slots_updates_subscribe(
+        &self,
+        meta: Self::Metadata,
+        subscriber: Subscriber<RpcResponse<()>>,
+    );
+
+    #[pubsub(
+        subscription = "slotsUpdatesNotification",
+        unsubscribe,
+        name = "slotsUpdatesUnsubscribe"
+    )]
+    fn slots_updates_unsubscribe(
+        &self,
+        meta: Option<Self::Metadata>,
+        subscription: SubscriptionId,
+    ) -> Result<bool>;
+
+    #[pubsub(subscription = "blockNotification", subscribe, name = "blockSubscribe")]
+    fn block_subscribe(&self, meta: Self::Metadata, subscriber: Subscriber<RpcResponse<()>>);
+
+    #[pubsub(
+        subscription = "blockNotification",
+        unsubscribe,
+        name = "blockUnsubscribe"
+    )]
+    fn block_unsubscribe(
+        &self,
+        meta: Option<Self::Metadata>,
+        subscription: SubscriptionId,
+    ) -> Result<bool>;
+
+    #[pubsub(subscription = "voteNotification", subscribe, name = "voteSubscribe")]
+    fn vote_subscribe(&self, meta: Self::Metadata, subscriber: Subscriber<RpcResponse<()>>);
+
+    #[pubsub(
+        subscription = "voteNotification",
+        unsubscribe,
+        name = "voteUnsubscribe"
+    )]
+    fn vote_unsubscribe(
+        &self,
+        meta: Option<Self::Metadata>,
+        subscription: SubscriptionId,
+    ) -> Result<bool>;
+
+    /// Subscribe to snapshot import notifications via WebSocket.
+    ///
+    /// This method allows clients to subscribe to real-time updates about snapshot import operations
+    /// from a specific snapshot URL. The subscriber will receive notifications when the snapshot
+    /// is being imported, including progress updates and completion status.
+    ///
+    /// ## Parameters
+    /// - `meta`: WebSocket metadata containing RPC context and connection information.
+    /// - `subscriber`: The subscription sink for sending snapshot import notifications to the client.
+    /// - `snapshot_url`: The URL of the snapshot to import and monitor.
+    ///
+    /// ## Returns
+    /// This method does not return a value directly. Instead, it establishes a continuous WebSocket
+    /// subscription that will send `SnapshotImportNotification` notifications to the subscriber whenever
+    /// the snapshot import operation status changes.
+    ///
+    /// ## Example WebSocket Request
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "id": 1,
+    ///   "method": "snapshotSubscribe",
+    ///   "params": ["https://example.com/snapshot.json"]
+    /// }
+    /// ```
+    ///
+    /// ## Example WebSocket Response (Subscription Confirmation)
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "result": 12345,
+    ///   "id": 1
+    /// }
+    /// ```
+    ///
+    /// ## Example WebSocket Notification
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "method": "snapshotNotification",
+    ///   "params": {
+    ///     "result": {
+    ///       "snapshotId": "snapshot_20240107_123456",
+    ///       "status": "InProgress",
+    ///       "accountsLoaded": 1500,
+    ///       "totalAccounts": 3000,
+    ///       "error": null
+    ///     },
+    ///     "subscription": 12345
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// ## Notes
+    /// - The subscription remains active until explicitly unsubscribed or the connection is closed.
+    /// - Multiple clients can subscribe to different snapshot notifications simultaneously.
+    /// - The snapshot URL must be accessible and contain a valid snapshot format.
+    /// - Each subscription runs in its own async task for optimal performance.
+    ///
+    /// ## See Also
+    /// - `snapshotUnsubscribe`: Remove an active snapshot subscription
+    #[pubsub(
+        subscription = "snapshotNotification",
+        subscribe,
+        name = "snapshotSubscribe"
+    )]
+    fn snapshot_subscribe(
+        &self,
+        meta: Self::Metadata,
+        subscriber: Subscriber<crate::surfnet::SnapshotImportNotification>,
+        snapshot_url: String,
+    );
+
+    /// Unsubscribe from snapshot import notifications.
+    ///
+    /// This method removes an active snapshot subscription, stopping further notifications
+    /// for the specified subscription ID.
+    ///
+    /// ## Parameters
+    /// - `meta`: Optional WebSocket metadata containing connection information.
+    /// - `subscription`: The subscription ID to remove, as returned by `snapshotSubscribe`.
+    ///
+    /// ## Returns
+    /// A `Result<bool>` indicating whether the unsubscription was successful:
+    /// - `Ok(true)` if the subscription was successfully removed
+    /// - `Err(Error)` with `InvalidParams` if the subscription ID doesn't exist
+    ///
+    /// ## Example WebSocket Request
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "id": 1,
+    ///   "method": "snapshotUnsubscribe",
+    ///   "params": [12345]
+    /// }
+    /// ```
+    ///
+    /// ## Example WebSocket Response
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "result": true,
+    ///   "id": 1
+    /// }
+    /// ```
+    ///
+    /// ## Notes
+    /// - Attempting to unsubscribe from a non-existent subscription will return an error.
+    /// - Successfully unsubscribed connections will no longer receive snapshot notifications.
+    /// - This method is thread-safe and can be called concurrently.
+    ///
+    /// ## See Also
+    /// - `snapshotSubscribe`: Create a snapshot import subscription
+    #[pubsub(
+        subscription = "snapshotNotification",
+        unsubscribe,
+        name = "snapshotUnsubscribe"
+    )]
+    fn snapshot_unsubscribe(
+        &self,
+        meta: Option<Self::Metadata>,
+        subscription: SubscriptionId,
+    ) -> Result<bool>;
 }
 
 /// WebSocket RPC server implementation for Surfpool.
@@ -620,6 +827,8 @@ pub struct SurfpoolWsRpc {
     pub slot_subscription_map: Arc<RwLock<HashMap<SubscriptionId, Sink<SlotInfo>>>>,
     pub logs_subscription_map:
         Arc<RwLock<HashMap<SubscriptionId, Sink<RpcResponse<RpcLogsResponse>>>>>,
+    pub snapshot_subscription_map:
+        Arc<RwLock<HashMap<SubscriptionId, Sink<crate::surfnet::SnapshotImportNotification>>>>,
     pub tokio_handle: tokio::runtime::Handle,
 }
 
@@ -651,6 +860,10 @@ impl Rpc for SurfpoolWsRpc {
         signature_str: String,
         config: Option<RpcSignatureSubscribeConfig>,
     ) {
+        let _ = meta
+            .as_ref()
+            .map(|m| m.log_debug("Websocket 'signature_subscribe' connection established"));
+
         let signature = match Signature::from_str(&signature_str) {
             Ok(sig) => sig,
             Err(_) => {
@@ -668,7 +881,7 @@ impl Rpc for SurfpoolWsRpc {
         let config = config.unwrap_or_default();
         let rpc_transaction_config = RpcTransactionConfig {
             encoding: Some(UiTransactionEncoding::Json),
-            commitment: config.commitment.clone(),
+            commitment: config.commitment,
             max_supported_transaction_version: Some(0),
         };
 
@@ -745,8 +958,20 @@ impl Rpc for SurfpoolWsRpc {
                         Some(TransactionConfirmationStatus::Processed),
                     )
                     | (
+                        &SignatureSubscriptionType::Commitment(CommitmentLevel::Processed),
+                        Some(TransactionConfirmationStatus::Confirmed),
+                    )
+                    | (
+                        &SignatureSubscriptionType::Commitment(CommitmentLevel::Processed),
+                        Some(TransactionConfirmationStatus::Finalized),
+                    )
+                    | (
                         &SignatureSubscriptionType::Commitment(CommitmentLevel::Confirmed),
                         Some(TransactionConfirmationStatus::Confirmed),
+                    )
+                    | (
+                        &SignatureSubscriptionType::Commitment(CommitmentLevel::Confirmed),
+                        Some(TransactionConfirmationStatus::Finalized),
                     )
                     | (
                         &SignatureSubscriptionType::Commitment(CommitmentLevel::Finalized),
@@ -757,7 +982,9 @@ impl Rpc for SurfpoolWsRpc {
                                 let _ = sink.notify(Ok(RpcResponse {
                                     context: RpcResponseContext::new(tx.slot),
                                     value: RpcSignatureResult::ProcessedSignature(
-                                        ProcessedSignatureResult { err: None },
+                                        ProcessedSignatureResult {
+                                            err: tx.err.map(|e| e.into()),
+                                        },
                                     ),
                                 }));
                             }
@@ -773,17 +1000,33 @@ impl Rpc for SurfpoolWsRpc {
                 svm_locker.subscribe_for_signature_updates(&signature, subscription_type.clone());
 
             loop {
-                let Ok((slot, some_err)) = rx.try_recv() else {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                    continue;
+                let (slot, some_err) = match rx.try_recv() {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        match e {
+                            TryRecvError::Empty => {
+                                // no update yet, continue
+                                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                                continue;
+                            }
+                            TryRecvError::Disconnected => {
+                                warn!(
+                                    "Signature subscription channel closed for sub id {:?}",
+                                    sub_id
+                                );
+                                // channel closed, exit loop
+                                break;
+                            }
+                        }
+                    }
                 };
 
-                let Ok(guard) = active.read() else {
+                let Ok(mut guard) = active.write() else {
                     log::error!("Failed to acquire read lock on signature_subscription_map");
                     break;
                 };
 
-                let Some(sink) = guard.get(&sub_id) else {
+                let Some(sink) = guard.remove(&sub_id) else {
                     log::error!("Failed to get sink for subscription ID");
                     break;
                 };
@@ -798,10 +1041,14 @@ impl Rpc for SurfpoolWsRpc {
                     SignatureSubscriptionType::Commitment(_) => sink.notify(Ok(RpcResponse {
                         context: RpcResponseContext::new(slot),
                         value: RpcSignatureResult::ProcessedSignature(ProcessedSignatureResult {
-                            err: some_err,
+                            err: some_err.map(|e| e.into()),
                         }),
                     })),
                 };
+
+                if guard.is_empty() {
+                    break;
+                }
 
                 if let Err(e) = res {
                     log::error!("Failed to notify client about account update: {e}");
@@ -872,6 +1119,10 @@ impl Rpc for SurfpoolWsRpc {
         pubkey_str: String,
         config: Option<RpcAccountSubscribeConfig>,
     ) {
+        let _ = meta
+            .as_ref()
+            .map(|m| m.log_debug("Websocket 'account_subscribe' connection established"));
+
         let pubkey = match Pubkey::from_str(&pubkey_str) {
             Ok(pk) => pk,
             Err(_) => {
@@ -1002,6 +1253,10 @@ impl Rpc for SurfpoolWsRpc {
     }
 
     fn slot_subscribe(&self, meta: Self::Metadata, subscriber: Subscriber<SlotInfo>) {
+        let _ = meta
+            .as_ref()
+            .map(|m| m.log_debug("Websocket 'slot_subscribe' connection established"));
+
         let id = self.uid.fetch_add(1, atomic::Ordering::SeqCst);
         let sub_id = SubscriptionId::Number(id as u64);
         let sink = match subscriber.assign_id(sub_id.clone()) {
@@ -1097,6 +1352,10 @@ impl Rpc for SurfpoolWsRpc {
         mentions: Option<RpcTransactionLogsFilter>,
         commitment: Option<CommitmentConfig>,
     ) {
+        let _ = meta
+            .as_ref()
+            .map(|m| m.log_debug("Websocket 'logs_subscribe' connection established"));
+
         let id = self.uid.fetch_add(1, atomic::Ordering::SeqCst);
         let sub_id = SubscriptionId::Number(id as u64);
         let sink = match subscriber.assign_id(sub_id.clone()) {
@@ -1182,6 +1441,208 @@ impl Rpc for SurfpoolWsRpc {
             guard.remove(&subscription);
         } else {
             log::error!("Failed to acquire write lock on logs_subscription_map");
+            return Err(Error {
+                code: ErrorCode::InternalError,
+                message: "Internal error.".into(),
+                data: None,
+            });
+        };
+        Ok(true)
+    }
+
+    fn root_subscribe(&self, meta: Self::Metadata, _subscriber: Subscriber<RpcResponse<()>>) {
+        let _ = meta
+            .as_ref()
+            .map(|m| m.log_warn("Websocket method 'root_subscribe' is uninmplemented"));
+    }
+
+    fn root_unsubscribe(
+        &self,
+        _meta: Option<Self::Metadata>,
+        _subscription: SubscriptionId,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn program_subscribe(&self, meta: Self::Metadata, _subscriber: Subscriber<RpcResponse<()>>) {
+        let _ = meta
+            .as_ref()
+            .map(|m| m.log_warn("Websocket method 'program_subscribe' is uninmplemented"));
+    }
+
+    fn program_unsubscribe(
+        &self,
+        _meta: Option<Self::Metadata>,
+        _subscription: SubscriptionId,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn slots_updates_subscribe(
+        &self,
+        meta: Self::Metadata,
+        _subscriber: Subscriber<RpcResponse<()>>,
+    ) {
+        let _ = meta
+            .as_ref()
+            .map(|m| m.log_warn("Websocket method 'slots_updates_subscribe' is uninmplemented"));
+    }
+
+    fn slots_updates_unsubscribe(
+        &self,
+        _meta: Option<Self::Metadata>,
+        _subscription: SubscriptionId,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn block_subscribe(&self, meta: Self::Metadata, _subscriber: Subscriber<RpcResponse<()>>) {
+        let _ = meta
+            .as_ref()
+            .map(|m| m.log_warn("Websocket method 'block_subscribe' is uninmplemented"));
+    }
+
+    fn block_unsubscribe(
+        &self,
+        _meta: Option<Self::Metadata>,
+        _subscription: SubscriptionId,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn vote_subscribe(&self, meta: Self::Metadata, _subscriber: Subscriber<RpcResponse<()>>) {
+        let _ = meta
+            .as_ref()
+            .map(|m| m.log_warn("Websocket method 'vote_subscribe' is uninmplemented"));
+    }
+
+    fn vote_unsubscribe(
+        &self,
+        _meta: Option<Self::Metadata>,
+        _subscription: SubscriptionId,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn snapshot_subscribe(
+        &self,
+        meta: Self::Metadata,
+        subscriber: Subscriber<crate::surfnet::SnapshotImportNotification>,
+        snapshot_url: String,
+    ) {
+        let _ = meta
+            .as_ref()
+            .map(|m| m.log_debug("Websocket 'snapshot_subscribe' connection established"));
+
+        // Validate snapshot URL format
+        if snapshot_url.is_empty() {
+            let error = Error {
+                code: ErrorCode::InvalidParams,
+                message: "Invalid snapshot URL: URL cannot be empty.".into(),
+                data: None,
+            };
+            if let Err(e) = subscriber.reject(error.clone()) {
+                log::error!("Failed to reject subscriber: {:?}", e);
+            }
+            return;
+        }
+
+        let id = self.uid.fetch_add(1, atomic::Ordering::SeqCst);
+        let sub_id = SubscriptionId::Number(id as u64);
+        let sink = match subscriber.assign_id(sub_id.clone()) {
+            Ok(sink) => sink,
+            Err(e) => {
+                log::error!("Failed to assign subscription ID: {:?}", e);
+                return;
+            }
+        };
+
+        let snapshot_active = Arc::clone(&self.snapshot_subscription_map);
+        let meta = meta.clone();
+
+        let svm_locker = match meta.get_svm_locker() {
+            Ok(locker) => locker,
+            Err(e) => {
+                log::error!("Failed to get SVM locker for snapshot subscription: {e}");
+                if let Err(e) = sink.notify(Err(e.into())) {
+                    log::error!(
+                        "Failed to send error notification to client for SVM locker failure: {e}"
+                    );
+                }
+                return;
+            }
+        };
+
+        self.tokio_handle.spawn(async move {
+            if let Ok(mut guard) = snapshot_active.write() {
+                guard.insert(sub_id.clone(), sink);
+            } else {
+                log::error!("Failed to acquire write lock on snapshot_subscription_map");
+                return;
+            }
+
+            // Generate a unique snapshot ID for this import operation
+            let snapshot_id = format!(
+                "snapshot_{}",
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            );
+
+            // Subscribe to snapshot import updates
+            // The locker will send the Started notification through the channel
+            let rx = svm_locker.subscribe_for_snapshot_import_updates(&snapshot_url, &snapshot_id);
+
+            loop {
+                // if the subscription has been removed, break the loop
+                if let Ok(guard) = snapshot_active.read() {
+                    if guard.get(&sub_id).is_none() {
+                        break;
+                    }
+                } else {
+                    log::error!("Failed to acquire read lock on snapshot_subscription_map");
+                    break;
+                }
+
+                let Ok(notification) = rx.try_recv() else {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    continue;
+                };
+
+                let Ok(guard) = snapshot_active.read() else {
+                    log::error!("Failed to acquire read lock on snapshot_subscription_map");
+                    break;
+                };
+
+                let Some(sink) = guard.get(&sub_id) else {
+                    log::error!("Failed to get sink for subscription ID");
+                    break;
+                };
+
+                if let Err(e) = sink.notify(Ok(notification)) {
+                    log::error!("Failed to notify client about snapshot import update: {e}");
+                    break;
+                }
+
+                // If the import is completed or failed, we can end the subscription
+                if let Ok(guard) = snapshot_active.read() {
+                    if let Some(_sink) = guard.get(&sub_id) {
+                        // Check if this was the final notification
+                        // We'll determine this by checking the status in the last notification
+                        // For now, we'll keep the subscription alive in case of multiple imports
+                    }
+                }
+            }
+        });
+    }
+
+    fn snapshot_unsubscribe(
+        &self,
+        _meta: Option<Self::Metadata>,
+        subscription: SubscriptionId,
+    ) -> Result<bool> {
+        if let Ok(mut guard) = self.snapshot_subscription_map.write() {
+            guard.remove(&subscription);
+        } else {
+            log::error!("Failed to acquire write lock on snapshot_subscription_map");
             return Err(Error {
                 code: ErrorCode::InternalError,
                 message: "Internal error.".into(),

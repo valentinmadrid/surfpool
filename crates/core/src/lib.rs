@@ -14,6 +14,8 @@ pub mod error;
 pub mod helpers;
 pub mod rpc;
 pub mod runloops;
+pub mod scenarios;
+pub mod storage;
 pub mod surfnet;
 pub mod types;
 
@@ -21,11 +23,15 @@ use crossbeam_channel::{Receiver, Sender};
 pub use jsonrpc_core;
 pub use jsonrpc_http_server;
 pub use litesvm;
+use solana_pubkey::Pubkey;
 pub use solana_rpc_client;
 use surfnet::{GeyserEvent, locker::SurfnetSvmLocker, svm::SurfnetSvm};
 use surfpool_types::{SimnetCommand, SubgraphCommand, SurfpoolConfig};
 use txtx_addon_network_svm_types::subgraph::PluginConfig;
 use uuid::Uuid;
+
+pub const SURFPOOL_IDENTITY_PUBKEY: Pubkey =
+    Pubkey::from_str_const("SUrFPooLSUrFPooLSUrFPooLSUrFPooLSUrFPooLSUr");
 
 pub async fn start_local_surfnet(
     surfnet_svm: SurfnetSvm,
@@ -47,9 +53,19 @@ pub async fn start_local_surfnet(
     .await
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginInfo {
+    pub plugin_name: String,
+    pub uuid: String,
+}
+
 #[derive(Debug)]
 pub enum PluginManagerCommand {
     LoadConfig(Uuid, PluginConfig, Sender<String>),
+    UnloadPlugin(Uuid, Sender<Result<(), String>>),
+    ReloadPlugin(Uuid, PluginConfig, Sender<String>),
+    ListPlugins(Sender<Vec<PluginInfo>>),
 }
 
 #[cfg(test)]

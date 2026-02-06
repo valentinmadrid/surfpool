@@ -745,7 +745,7 @@ mod tests {
     };
     use solana_program_pack::Pack;
     use solana_pubkey::Pubkey;
-    use spl_token::state::Account as TokenAccount;
+    use spl_token_interface::state::Account as TokenAccount;
     use surfpool_types::SupplyUpdate;
 
     use super::{AccountsScan, SurfpoolAccountsScanRpc};
@@ -1219,9 +1219,8 @@ mod tests {
                 result
                     .value
                     .iter()
-                    .find(|bal| bal.address == large_circulating_pubkey.to_string()
-                        && bal.lamports == large_circulating_amount)
-                    .is_some(),
+                    .any(|bal| bal.address == large_circulating_pubkey.to_string()
+                        && bal.lamports == large_circulating_amount),
                 "Circulating account should be in circulating accounts list"
             );
             assert_eq!(large_circulating_amount, result.value[0].lamports);
@@ -1250,14 +1249,9 @@ mod tests {
 
             assert_eq!(result.value.len(), 1);
             assert!(
-                result
-                    .value
-                    .iter()
-                    .find(
-                        |bal| bal.address == large_non_circulating_pubkey.to_string()
-                            && bal.lamports == large_non_circulating_amount
-                    )
-                    .is_some(),
+                result.value.iter().any(|bal| bal.address
+                    == large_non_circulating_pubkey.to_string()
+                    && bal.lamports == large_non_circulating_amount),
                 "Non-circulating account should be in non-circulating accounts list: {:?}",
                 result.value
             );
@@ -1330,12 +1324,12 @@ mod tests {
         let minimum_rent = setup.context.svm_locker.with_svm_reader(|svm_reader| {
             svm_reader
                 .inner
-                .minimum_balance_for_rent_exemption(spl_token::state::Mint::LEN)
+                .minimum_balance_for_rent_exemption(spl_token_interface::state::Mint::LEN)
         });
 
         // create mint account
-        let mut mint_data = [0; spl_token::state::Mint::LEN];
-        let mint = spl_token::state::Mint {
+        let mut mint_data = [0; spl_token_interface::state::Mint::LEN];
+        let mint = spl_token_interface::state::Mint {
             decimals: 9,
             supply: 1000000000000000,
             is_initialized: true,
@@ -1345,7 +1339,7 @@ mod tests {
 
         let mint_account = Account {
             lamports: minimum_rent,
-            owner: spl_token::ID,
+            owner: spl_token_interface::ID,
             executable: false,
             rent_epoch: 0,
             data: mint_data.to_vec(),
@@ -1374,7 +1368,7 @@ mod tests {
                     owner: Pubkey::new_unique(),
                     amount: *amount,
                     delegate: solana_program_option::COption::None,
-                    state: spl_token::state::AccountState::Initialized,
+                    state: spl_token_interface::state::AccountState::Initialized,
                     is_native: solana_program_option::COption::None,
                     delegated_amount: 0,
                     close_authority: solana_program_option::COption::None,
@@ -1383,7 +1377,7 @@ mod tests {
 
                 let account = Account {
                     lamports: minimum_rent,
-                    owner: spl_token::ID,
+                    owner: spl_token_interface::ID,
                     executable: false,
                     rent_epoch: 0,
                     data: token_account_data.to_vec(),
@@ -1430,12 +1424,12 @@ mod tests {
         let minimum_rent = setup.context.svm_locker.with_svm_reader(|svm_reader| {
             svm_reader
                 .inner
-                .minimum_balance_for_rent_exemption(spl_token::state::Mint::LEN)
+                .minimum_balance_for_rent_exemption(spl_token_interface::state::Mint::LEN)
         });
 
         // Create mint account
-        let mut mint_data = [0; spl_token::state::Mint::LEN];
-        let mint = spl_token::state::Mint {
+        let mut mint_data = [0; spl_token_interface::state::Mint::LEN];
+        let mint = spl_token_interface::state::Mint {
             decimals: 6,
             supply: 1000000000000000,
             is_initialized: true,
@@ -1445,7 +1439,7 @@ mod tests {
 
         let mint_account = Account {
             lamports: minimum_rent,
-            owner: spl_token::ID,
+            owner: spl_token_interface::ID,
             executable: false,
             rent_epoch: 0,
             data: mint_data.to_vec(),
@@ -1471,7 +1465,7 @@ mod tests {
                     owner: Pubkey::new_unique(),
                     amount: *amount,
                     delegate: solana_program_option::COption::None,
-                    state: spl_token::state::AccountState::Initialized,
+                    state: spl_token_interface::state::AccountState::Initialized,
                     is_native: solana_program_option::COption::None,
                     delegated_amount: 0,
                     close_authority: solana_program_option::COption::None,
@@ -1480,7 +1474,7 @@ mod tests {
 
                 let account = Account {
                     lamports: minimum_rent,
-                    owner: spl_token::ID,
+                    owner: spl_token_interface::ID,
                     executable: false,
                     rent_epoch: 0,
                     data: token_account_data.to_vec(),
@@ -1536,12 +1530,12 @@ mod tests {
         let minimum_rent = setup.context.svm_locker.with_svm_reader(|svm_reader| {
             svm_reader
                 .inner
-                .minimum_balance_for_rent_exemption(spl_token::state::Mint::LEN)
+                .minimum_balance_for_rent_exemption(spl_token_interface::state::Mint::LEN)
         });
 
         // Create mint account with no associated token accounts
-        let mut mint_data = [0; spl_token::state::Mint::LEN];
-        let mint = spl_token::state::Mint {
+        let mut mint_data = [0; spl_token_interface::state::Mint::LEN];
+        let mint = spl_token_interface::state::Mint {
             decimals: 9,
             supply: 0,
             is_initialized: true,
@@ -1551,7 +1545,7 @@ mod tests {
 
         let mint_account = Account {
             lamports: minimum_rent,
-            owner: spl_token::ID,
+            owner: spl_token_interface::ID,
             executable: false,
             rent_epoch: 0,
             data: mint_data.to_vec(),
@@ -1596,16 +1590,16 @@ mod tests {
         let owner = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         let token_account_pubkey = Pubkey::new_unique();
-        let token_program = spl_token::id();
+        let token_program = spl_token_interface::id();
 
         // create a token account with delegate
-        let mut token_account_data = [0u8; spl_token::state::Account::LEN];
-        let token_account = spl_token::state::Account {
+        let mut token_account_data = [0u8; spl_token_interface::state::Account::LEN];
+        let token_account = spl_token_interface::state::Account {
             mint,
             owner,
             amount: 1000,
             delegate: solana_program_option::COption::Some(delegate),
-            state: spl_token::state::AccountState::Initialized,
+            state: spl_token_interface::state::AccountState::Initialized,
             is_native: solana_program_option::COption::None,
             delegated_amount: 500,
             close_authority: solana_program_option::COption::None,
@@ -1715,16 +1709,16 @@ mod tests {
         let mint2 = Pubkey::new_unique();
         let token_account1 = Pubkey::new_unique();
         let token_account2 = Pubkey::new_unique();
-        let token_program = spl_token::id();
+        let token_program = spl_token_interface::id();
 
         // create first token account with delegate
-        let mut token_account_data1 = [0u8; spl_token::state::Account::LEN];
-        let token_account_struct1 = spl_token::state::Account {
+        let mut token_account_data1 = [0u8; spl_token_interface::state::Account::LEN];
+        let token_account_struct1 = spl_token_interface::state::Account {
             mint: mint1,
             owner: owner1,
             amount: 1000,
             delegate: solana_program_option::COption::Some(delegate),
-            state: spl_token::state::AccountState::Initialized,
+            state: spl_token_interface::state::AccountState::Initialized,
             is_native: solana_program_option::COption::None,
             delegated_amount: 500,
             close_authority: solana_program_option::COption::None,
@@ -1735,13 +1729,13 @@ mod tests {
         );
 
         // create second token account with same delegate
-        let mut token_account_data2 = [0u8; spl_token::state::Account::LEN];
-        let token_account_struct2 = spl_token::state::Account {
+        let mut token_account_data2 = [0u8; spl_token_interface::state::Account::LEN];
+        let token_account_struct2 = spl_token_interface::state::Account {
             mint: mint2,
             owner: owner2,
             amount: 2000,
             delegate: solana_program_option::COption::Some(delegate),
-            state: spl_token::state::AccountState::Initialized,
+            state: spl_token_interface::state::AccountState::Initialized,
             is_native: solana_program_option::COption::None,
             delegated_amount: 1000,
             close_authority: solana_program_option::COption::None,

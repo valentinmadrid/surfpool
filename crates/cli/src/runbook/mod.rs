@@ -19,7 +19,7 @@ use txtx_core::{
         RunbookStateLocation, WorkspaceManifest,
         file::{read_runbook_from_location, read_runbooks_from_manifest},
     },
-    runbook::{ConsolidatedChanges, SynthesizedChange},
+    runbook::{ConsolidatedChanges, RunbookTopLevelInputsMap, SynthesizedChange},
     start_supervised_runbook_runloop, start_unsupervised_runbook_runloop,
     std::StdAddon,
     types::{Runbook, RunbookSnapshotContext, RunbookSources},
@@ -28,6 +28,7 @@ use txtx_core::{
 use txtx_gql::kit::{
     indexmap::IndexMap,
     types::{
+        RunbookId,
         cloud_interface::CloudServiceContext,
         frontend::{LogDetails, LogEvent, LogLevel, TransientLogEventStatus},
         types::{AddonJsonConverter, Value},
@@ -41,10 +42,9 @@ use crate::cli::{DEFAULT_ID_SVC_URL, ExecuteRunbook, setup_logger};
 
 lazy_static::lazy_static! {
     static ref CLI_SPINNER_STYLE: ProgressStyle = {
-        let style = ProgressStyle::with_template("{spinner} {msg}")
+        ProgressStyle::with_template("{spinner} {msg}")
             .unwrap()
-            .tick_strings(&["⠋", "⠙", "⠸", "⠴", "⠦", "⠇"]);
-        style
+            .tick_strings(&["⠋", "⠙", "⠸", "⠴", "⠦", "⠇"])
     };
 }
 
@@ -60,6 +60,7 @@ pub fn get_json_converters() -> Vec<AddonJsonConverter<'static>> {
 pub fn get_available_addons() -> Vec<Box<dyn Addon>> {
     vec![Box::new(StdAddon::new()), Box::new(SvmNetworkAddon::new())]
 }
+
 pub fn get_addon_by_namespace(namespace: &str) -> Option<Box<dyn Addon>> {
     get_available_addons()
         .into_iter()
@@ -103,20 +104,19 @@ pub async fn handle_execute_runbook_command(cmd: ExecuteRunbook) -> Result<(), S
         let mut active_spinners: IndexMap<Uuid, ProgressBar> = IndexMap::new();
         let mut multi_progress = MultiProgress::new();
         while let Ok(msg) = progress_rx.recv() {
-            match msg {
-                BlockEvent::LogEvent(log) => handle_log_event(
+            if let BlockEvent::LogEvent(log) = msg {
+                handle_log_event(
                     &mut multi_progress,
                     log,
                     &log_filter,
                     &mut active_spinners,
                     true,
-                ),
-                _ => {}
+                )
             }
         }
     });
 
-    execute_runbook(progress_tx, simnet_events_tx, cmd, true).await?;
+    execute_on_disk_runbook(progress_tx, simnet_events_tx, cmd, true).await?;
 
     Ok(())
 }
@@ -132,7 +132,31 @@ pub async fn load_runbook_from_file_path(
     Ok((runbook_name, runbook, runbook_sources))
 }
 
-pub async fn execute_runbook(
+pub async fn execute_in_memory_runbook(
+    progress_tx: Sender<BlockEvent>,
+    simnet_events_tx: crossbeam::channel::Sender<SimnetEvent>,
+    cmd: ExecuteRunbook,
+    do_setup_logger: bool,
+    runbook_id: String,
+    manifest: WorkspaceManifest,
+    runbook_sources: RunbookSources,
+) -> Result<(), String> {
+    let runbook = Runbook::new(RunbookId::new(None, None, &runbook_id), None);
+    execute_runbook(
+        progress_tx,
+        simnet_events_tx,
+        cmd,
+        do_setup_logger,
+        runbook_id,
+        manifest,
+        runbook,
+        runbook_sources,
+        None,
+    )
+    .await
+}
+
+pub async fn execute_on_disk_runbook(
     progress_tx: Sender<BlockEvent>,
     simnet_events_tx: crossbeam::channel::Sender<SimnetEvent>,
     cmd: ExecuteRunbook,
@@ -143,8 +167,7 @@ pub async fn execute_runbook(
     let runbook_selector = vec![runbook_id.clone()];
     let mut runbooks =
         read_runbooks_from_manifest(&manifest, &cmd.environment, Some(&runbook_selector))?;
-
-    let (mut runbook, runbook_sources, _, runbook_state_location) =
+    let (runbook, runbook_sources, _, runbook_state_location) =
         match runbooks.swap_remove(&runbook_id) {
             Some(res) => res,
             None => {
@@ -153,8 +176,40 @@ pub async fn execute_runbook(
                 (runbook, sources, runbook_name, None)
             }
         };
+    execute_runbook(
+        progress_tx,
+        simnet_events_tx,
+        cmd,
+        do_setup_logger,
+        runbook_id,
+        manifest,
+        runbook,
+        runbook_sources,
+        runbook_state_location,
+    )
+    .await
+}
 
-    let top_level_inputs_map = manifest.get_runbook_inputs(&cmd.environment, &cmd.inputs, None)?;
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_runbook(
+    progress_tx: Sender<BlockEvent>,
+    simnet_events_tx: crossbeam::channel::Sender<SimnetEvent>,
+    cmd: ExecuteRunbook,
+    do_setup_logger: bool,
+    runbook_id: String,
+    manifest: WorkspaceManifest,
+    mut runbook: Runbook,
+    runbook_sources: RunbookSources,
+    runbook_state_location: Option<RunbookStateLocation>,
+) -> Result<(), String> {
+    let top_level_inputs_map = manifest
+        .get_runbook_inputs(&cmd.environment, &cmd.inputs, None)
+        .unwrap_or_else(|_| RunbookTopLevelInputsMap::new());
+
+    let authorization_context = manifest
+        .location
+        .map(AuthorizationContext::new)
+        .unwrap_or_else(AuthorizationContext::empty);
 
     if do_setup_logger {
         setup_logger(
@@ -166,7 +221,6 @@ pub async fn execute_runbook(
         )?;
     }
 
-    let authorization_context = AuthorizationContext::new(manifest.location.clone().unwrap());
     let cloud_svc_context = CloudServiceContext::new(Some(Arc::new(
         TxtxAuthenticatedCloudServiceRouter::new(DEFAULT_ID_SVC_URL),
     )));
@@ -277,7 +331,7 @@ pub async fn execute_runbook(
             .as_ref()
             .map_err(|ds| ds.iter().map(|d| d.message.clone()).collect())
             .err();
-        process_runbook_execution_output(
+        let success = process_runbook_execution_output(
             res,
             &mut runbook,
             runbook_state_location,
@@ -285,6 +339,9 @@ pub async fn execute_runbook(
             cmd.output_json,
         );
         let _ = simnet_events_tx.send(SimnetEvent::RunbookCompleted(runbook_id, diags));
+        if !success {
+            return Err("Runbook execution failed".to_string());
+        }
     } else {
         let (kill_supervised_execution_tx, block_store_handle) =
             configure_supervised_execution(runbook, runbook_state_location, &cmd, simnet_events_tx)
@@ -355,7 +412,7 @@ pub async fn configure_supervised_execution(
         let runloop_future =
             start_supervised_runbook_runloop(&mut runbook, moved_block_tx, action_item_events_rx);
 
-        process_runbook_execution_output(
+        let success = process_runbook_execution_output(
             hiro_system_kit::nestable_block_on(runloop_future),
             &mut runbook,
             moved_runbook_state,
@@ -363,7 +420,12 @@ pub async fn configure_supervised_execution(
             output_json,
         );
 
-        if let Err(_e) = moved_kill_loops_tx.send(true) {
+        if let Err(e) = moved_kill_loops_tx.send(true) {
+            error!("Failed to send kill signal: {}", e);
+            std::process::exit(1);
+        }
+
+        if !success {
             std::process::exit(1);
         }
     });
@@ -401,9 +463,9 @@ pub async fn configure_supervised_execution(
             while let Ok(msg) = supervisor_events_rx.recv() {
                 match msg {
                     txtx_supervisor_ui::SupervisorEvents::Started(network_binding) => {
-                        let _ = moved_simnet_events_tx.send(SimnetEvent::info(format!(
-                            "Starting the supervisor web console",
-                        )));
+                        let _ = moved_simnet_events_tx.send(SimnetEvent::info(
+                            "Starting the supervisor web console".to_string(),
+                        ));
                         let _ = moved_simnet_events_tx
                             .send(SimnetEvent::info(format!("http://{}", network_binding)));
                     }
@@ -684,11 +746,12 @@ fn process_runbook_execution_output(
     runbook_state_location: Option<RunbookStateLocation>,
     simnet_events_tx: &Sender<SimnetEvent>,
     output_json: Option<Option<String>>,
-) {
+) -> bool {
     if let Err(diags) = execution_result {
         let _ = simnet_events_tx.send(SimnetEvent::warn("Runbook execution aborted"));
         log_diagnostic_lines(diags, simnet_events_tx);
         write_runbook_transient_state(runbook, runbook_state_location, simnet_events_tx);
+        return false;
     } else {
         let runbook_outputs = runbook.collect_formatted_outputs();
         if !runbook_outputs.is_empty() {
@@ -734,6 +797,7 @@ fn process_runbook_execution_output(
             }
         }
         write_runbook_state(runbook, runbook_state_location, simnet_events_tx);
+        return true;
     }
 }
 
@@ -749,32 +813,32 @@ pub fn persist_log(
     match log_level {
         LogLevel::Trace => {
             trace!(target: &namespace, "{}", msg);
-            if do_log_to_cli && log_filter.should_log(&log_level) {
+            if do_log_to_cli && log_filter.should_log(log_level) {
                 println!("→ {}", msg);
             }
         }
         LogLevel::Debug => {
             debug!(target: &namespace, "{}", msg);
-            if do_log_to_cli && log_filter.should_log(&log_level) {
+            if do_log_to_cli && log_filter.should_log(log_level) {
                 println!("→ {}", msg);
             }
         }
 
         LogLevel::Info => {
             info!(target: &namespace, "{}", msg);
-            if do_log_to_cli && log_filter.should_log(&log_level) {
+            if do_log_to_cli && log_filter.should_log(log_level) {
                 println!("{} {} - {}", purple!("→"), purple!(summary), message);
             }
         }
         LogLevel::Warn => {
             warn!(target: &namespace, "{}", msg);
-            if do_log_to_cli && log_filter.should_log(&log_level) {
+            if do_log_to_cli && log_filter.should_log(log_level) {
                 println!("{} {} - {}", yellow!("!"), yellow!(summary), message);
             }
         }
         LogLevel::Error => {
             error!(target: &namespace, "{}", msg);
-            if do_log_to_cli && log_filter.should_log(&log_level) {
+            if do_log_to_cli && log_filter.should_log(log_level) {
                 println!("{} {} - {}", red!("x"), red!(summary), message);
             }
         }
@@ -796,7 +860,7 @@ pub fn handle_log_event(
                 &summary,
                 &static_log_event.namespace,
                 &static_log_event.level,
-                &log_filter,
+                log_filter,
                 do_log_to_cli,
             );
         }
@@ -821,7 +885,7 @@ pub fn handle_log_event(
                         &summary,
                         &log.namespace,
                         &log.level,
-                        &log_filter,
+                        log_filter,
                         false,
                     );
                 }
@@ -841,7 +905,7 @@ pub fn handle_log_event(
                     &summary,
                     &log.namespace,
                     &log.level,
-                    &log_filter,
+                    log_filter,
                     false,
                 );
             }
@@ -859,7 +923,7 @@ pub fn handle_log_event(
                     &summary,
                     &log.namespace,
                     &log.level,
-                    &log_filter,
+                    log_filter,
                     false,
                 );
             }

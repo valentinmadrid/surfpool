@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt::Display};
 
 use crossbeam_channel::Sender;
 use jsonrpc_core::Result as RpcError;
@@ -11,7 +11,7 @@ use solana_commitment_config::CommitmentLevel;
 use solana_epoch_info::EpochInfo;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
-use solana_transaction::sanitized::SanitizedTransaction;
+use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status::{EncodedConfirmedTransactionWithStatusMeta, TransactionStatus};
 use svm::SurfnetSvm;
@@ -23,19 +23,70 @@ use crate::{
 
 pub mod locker;
 pub mod remote;
+pub mod surfnet_lite_svm;
 pub mod svm;
 
-pub const SURFPOOL_IDENTITY_PUBKEY: Pubkey =
-    Pubkey::from_str_const("SUrFPooLSUrFPooLSUrFPooLSUrFPooLSUrFPooLSUr");
 pub const FINALIZATION_SLOT_THRESHOLD: u64 = 31;
 pub const SLOTS_PER_EPOCH: u64 = 432000;
 
 pub type AccountFactory = Box<dyn Fn(SurfnetSvmLocker) -> GetAccountResult + Send + Sync>;
 
+/// Slot status for geyser plugin notifications.
+/// Mirrors `agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeyserSlotStatus {
+    /// Slot is being processed
+    Processed,
+    /// Slot has been rooted (finalized)
+    Rooted,
+    /// Slot has been confirmed
+    Confirmed,
+}
+
+/// Block metadata for geyser plugin notifications.
+#[derive(Debug, Clone)]
+pub struct GeyserBlockMetadata {
+    pub slot: Slot,
+    pub blockhash: String,
+    pub parent_slot: Slot,
+    pub parent_blockhash: String,
+    pub block_time: Option<i64>,
+    pub block_height: Option<u64>,
+    pub executed_transaction_count: u64,
+    pub entry_count: u64,
+}
+
+/// Entry info for geyser plugin notifications.
+/// Surfpool emits one entry per block (simplified model).
+#[derive(Debug, Clone)]
+pub struct GeyserEntryInfo {
+    pub slot: Slot,
+    pub index: usize,
+    pub num_hashes: u64,
+    pub hash: Vec<u8>,
+    pub executed_transaction_count: u64,
+    pub starting_transaction_index: usize,
+}
+
+#[allow(clippy::large_enum_variant)]
 pub enum GeyserEvent {
-    NotifyTransaction(TransactionWithStatusMeta, Option<SanitizedTransaction>),
+    NotifyTransaction(TransactionWithStatusMeta, Option<VersionedTransaction>),
     UpdateAccount(GeyserAccountUpdate),
-    // todo: add more events
+    /// Account update sent at startup (before block production begins).
+    /// These updates should be sent to geyser plugins with is_startup=true.
+    StartupAccountUpdate(GeyserAccountUpdate),
+    /// Notify plugins that startup is complete.
+    EndOfStartup,
+    /// Update slot status (processed, confirmed, rooted/finalized).
+    UpdateSlotStatus {
+        slot: Slot,
+        parent: Option<Slot>,
+        status: GeyserSlotStatus,
+    },
+    /// Notify plugins of block metadata.
+    NotifyBlockMetadata(GeyserBlockMetadata),
+    /// Notify plugins of entry execution.
+    NotifyEntry(GeyserEntryInfo),
 }
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
@@ -60,7 +111,7 @@ impl BlockIdentifier {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockHeader {
     pub hash: String,
     pub previous_blockhash: String,
@@ -90,10 +141,38 @@ pub type LogsSubscriptionData = (
     Sender<(Slot, RpcLogsResponse)>,
 );
 
+pub type SnapshotSubscriptionData = Sender<SnapshotImportNotification>;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotImportNotification {
+    pub snapshot_id: String,
+    pub status: SnapshotImportStatus,
+    pub accounts_loaded: u64,
+    pub total_accounts: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum SnapshotImportStatus {
+    Started,
+    InProgress,
+    Completed,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SignatureSubscriptionType {
     Received,
     Commitment(CommitmentLevel),
+}
+
+impl Display for SignatureSubscriptionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SignatureSubscriptionType::Received => write!(f, "received"),
+            SignatureSubscriptionType::Commitment(level) => write!(f, "{level}"),
+        }
+    }
 }
 
 type DoUpdateSvm = bool;
@@ -152,6 +231,7 @@ impl GetAccountResult {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn map_account_with_token_data(
         self,
     ) -> Option<((Pubkey, Account), Option<(Pubkey, Option<Account>)>)> {
@@ -203,6 +283,7 @@ impl SignatureSubscriptionType {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum GetTransactionResult {
     None(Signature),
     FoundTransaction(
@@ -219,22 +300,36 @@ impl GetTransactionResult {
         latest_absolute_slot: u64,
     ) -> Self {
         let is_finalized = latest_absolute_slot >= tx.slot + FINALIZATION_SLOT_THRESHOLD;
+        let is_confirmed = latest_absolute_slot >= tx.slot + 1;
         let (confirmation_status, confirmations) = if is_finalized {
             (
                 Some(solana_transaction_status::TransactionConfirmationStatus::Finalized),
                 None,
             )
-        } else {
+        } else if is_confirmed {
             (
                 Some(solana_transaction_status::TransactionConfirmationStatus::Confirmed),
+                Some((latest_absolute_slot - tx.slot) as usize),
+            )
+        } else {
+            (
+                Some(solana_transaction_status::TransactionConfirmationStatus::Processed),
                 Some((latest_absolute_slot - tx.slot) as usize),
             )
         };
         let status = TransactionStatus {
             slot: tx.slot,
             confirmations,
-            status: tx.transaction.clone().meta.map_or(Ok(()), |m| m.status),
-            err: tx.transaction.clone().meta.and_then(|m| m.err),
+            status: tx
+                .transaction
+                .clone()
+                .meta
+                .map_or(Ok(()), |m| m.status.map_err(|e| e.into())),
+            err: tx
+                .transaction
+                .clone()
+                .meta
+                .and_then(|m| m.err.map(|e| e.into())),
             confirmation_status,
         };
 

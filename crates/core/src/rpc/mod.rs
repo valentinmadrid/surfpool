@@ -3,13 +3,13 @@ use std::{future::Future, sync::Arc};
 use blake3::Hash;
 use crossbeam_channel::Sender;
 use jsonrpc_core::{
-    BoxFuture, Error, FutureResponse, Metadata, Middleware, Request, Response,
+    BoxFuture, Error, ErrorCode, FutureResponse, Metadata, Middleware, Request, Response,
     futures::{FutureExt, future::Either},
     middleware,
 };
 use jsonrpc_pubsub::{PubSubMetadata, Session};
 use solana_clock::Slot;
-use surfpool_types::{SimnetCommand, types::RpcConfig};
+use surfpool_types::{SimnetCommand, SimnetEvent, types::RpcConfig};
 
 use crate::{
     PluginManagerCommand,
@@ -47,6 +47,7 @@ pub struct RunloopContext {
     pub simnet_commands_tx: Sender<SimnetCommand>,
     pub plugin_manager_commands_tx: Sender<PluginManagerCommand>,
     pub remote_rpc_client: Option<SurfnetRemoteClient>,
+    pub rpc_config: RpcConfig,
 }
 
 pub struct SurfnetRpcContext<T> {
@@ -146,14 +147,42 @@ impl Middleware<Option<RunloopContext>> for SurfpoolMiddleware {
         F: FnOnce(Request, Option<RunloopContext>) -> X + Send,
         X: Future<Output = Option<Response>> + Send + 'static,
     {
+        let Request::Single(jsonrpc_core::Call::MethodCall(ref method_call)) = request else {
+            let error = Response::from(
+                Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: "Only method calls are supported".into(),
+                    data: None,
+                },
+                None,
+            );
+            warn!("Request rejected due to not being a single method call");
+
+            return Either::Left(Box::pin(async move { Some(error) }));
+        };
+
+        let method_name = method_call.method.clone();
+        debug!("Processing request '{}'", method_name);
+
         let meta = Some(RunloopContext {
             id: None,
             svm_locker: self.surfnet_svm.clone(),
             simnet_commands_tx: self.simnet_commands_tx.clone(),
             plugin_manager_commands_tx: self.plugin_manager_commands_tx.clone(),
             remote_rpc_client: self.remote_rpc_client.clone(),
+            rpc_config: self.config.clone(),
         });
-        Either::Left(Box::pin(next(request, meta).map(move |res| res)))
+        Either::Left(Box::pin(next(request, meta).map(move |res| {
+            if let Some(Response::Single(output)) = &res {
+                if let jsonrpc_core::Output::Failure(failure) = output {
+                    debug!(
+                        "RPC error for method '{}': code={:?}, message={}",
+                        method_name, failure.error.code, failure.error.message
+                    );
+                }
+            }
+            res
+        })))
     }
 }
 
@@ -192,6 +221,7 @@ impl Middleware<Option<SurfpoolWebsocketMeta>> for SurfpoolWebsocketMiddleware {
             simnet_commands_tx: self.surfpool_middleware.simnet_commands_tx.clone(),
             plugin_manager_commands_tx: self.surfpool_middleware.plugin_manager_commands_tx.clone(),
             remote_rpc_client: self.surfpool_middleware.remote_rpc_client.clone(),
+            rpc_config: self.surfpool_middleware.config.clone(),
         };
         let session = meta
             .as_ref()
@@ -214,6 +244,22 @@ impl SurfpoolWebsocketMeta {
             runloop_context,
             session,
         }
+    }
+
+    pub fn log_debug(&self, msg: &str) {
+        let _ = self
+            .runloop_context
+            .svm_locker
+            .simnet_events_tx()
+            .send(SimnetEvent::debug(msg));
+    }
+
+    pub fn log_warn(&self, msg: &str) {
+        let _ = self
+            .runloop_context
+            .svm_locker
+            .simnet_events_tx()
+            .send(SimnetEvent::warn(msg));
     }
 }
 

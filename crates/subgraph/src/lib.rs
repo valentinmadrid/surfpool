@@ -2,8 +2,8 @@ use std::{collections::HashMap, sync::Mutex};
 
 use agave_geyser_plugin_interface::geyser_plugin_interface::{
     GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions, ReplicaBlockInfoVersions,
-    ReplicaEntryInfoVersions, ReplicaTransactionInfoV2, ReplicaTransactionInfoVersions,
-    Result as PluginResult, SlotStatus,
+    ReplicaEntryInfoVersions, ReplicaTransactionInfoV2, ReplicaTransactionInfoV3,
+    ReplicaTransactionInfoVersions, Result as PluginResult, SlotStatus,
 };
 use ipc_channel::ipc::IpcSender;
 use solana_clock::Slot;
@@ -159,11 +159,11 @@ impl GeyserPlugin for SurfpoolSubgraphPlugin {
         let mut entries = vec![];
         match transaction {
             ReplicaTransactionInfoVersions::V0_0_2(data) => {
-                probe_transaction(
+                probe_transaction_legacy(
                     &self.account_update_purgatory,
                     &self.pda_mappings,
                     subgraph_request,
-                    &data,
+                    data,
                     slot,
                     &mut entries,
                 )
@@ -176,6 +176,19 @@ impl GeyserPlugin for SurfpoolSubgraphPlugin {
                     "ReplicaTransactionInfoVersions::V0_0_1 is not supported, skipping transaction"
                         .into(),
                 ));
+            }
+            ReplicaTransactionInfoVersions::V0_0_3(data) => {
+                probe_transaction(
+                    &self.account_update_purgatory,
+                    &self.pda_mappings,
+                    subgraph_request,
+                    data,
+                    slot,
+                    &mut entries,
+                )
+                .map_err(|e| GeyserPluginError::TransactionUpdateError {
+                    msg: format!("{} at slot {}", e, slot),
+                })?;
             }
         };
         if !entries.is_empty() {
@@ -218,6 +231,7 @@ pub unsafe extern "C" fn _create_plugin() -> *mut dyn GeyserPlugin {
     Box::into_raw(plugin)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn probe_account(
     purgatory: &Mutex<AccountPurgatory>,
     pda_mappings: &Mutex<PdaMapping>,
@@ -229,7 +243,14 @@ pub fn probe_account(
     lamports: u64,
     entries: &mut Vec<HashMap<String, Value>>,
 ) -> Result<(), String> {
-    if let Some(pda_source) = PdaMapping::get(&pda_mappings, &pubkey).unwrap() {
+    let SubgraphRequest::V0(subgraph_request_v0) = subgraph_request;
+
+    // Only process accounts owned by the configured program
+    if owner != subgraph_request_v0.program_id {
+        return Ok(());
+    }
+
+    if let Some(pda_source) = PdaMapping::get(pda_mappings, &pubkey).unwrap() {
         pda_source.evaluate_account_update(
             &data,
             subgraph_request,
@@ -240,7 +261,7 @@ pub fn probe_account(
             entries,
         )
     } else {
-        AccountPurgatory::banish(&purgatory, &pubkey, slot, data, owner, lamports)
+        AccountPurgatory::banish(purgatory, &pubkey, slot, data, owner, lamports)
     }
     .map_err(|e| {
         format!(
@@ -254,6 +275,111 @@ pub fn probe_transaction(
     purgatory: &Mutex<AccountPurgatory>,
     pda_mappings: &Mutex<PdaMapping>,
     subgraph_request: &SubgraphRequest,
+    data: &ReplicaTransactionInfoV3<'_>,
+    slot: Slot,
+    entries: &mut Vec<HashMap<String, Value>>,
+) -> Result<(), String> {
+    let SubgraphRequest::V0(subgraph_request_v0) = subgraph_request;
+    if data.is_vote {
+        return Ok(());
+    }
+
+    let transaction = data.transaction;
+    // FIXME: for versioned messages we have to handle also dynamic keys
+    let account_keys = transaction.message.static_account_keys();
+    let account_pubkeys = account_keys.iter().cloned().collect::<Vec<_>>();
+    let is_program_id_match = transaction.message.instructions().iter().any(|ix| {
+        ix.program_id(account_pubkeys.as_ref())
+            .eq(&subgraph_request_v0.program_id)
+    });
+    if !is_program_id_match {
+        return Ok(());
+    }
+
+    match &subgraph_request_v0.data_source {
+        IndexedSubgraphSourceType::Instruction(_) => return Ok(()),
+        IndexedSubgraphSourceType::Event(event_source) =>
+        // Check inner instructions
+        {
+            if let Some(ref inner_instructions) = data.transaction_status_meta.inner_instructions {
+                event_source
+                    .evaluate_inner_instructions(
+                        inner_instructions,
+                        subgraph_request,
+                        slot,
+                        *transaction.signatures.first().unwrap(),
+                        entries,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "Failed to evaluate inner instructions for event source: {}",
+                            e
+                        )
+                    })?;
+            }
+        }
+        IndexedSubgraphSourceType::Pda(pda_source) => {
+            for instruction in transaction.message.instructions() {
+                let Some(pda) = pda_source.evaluate_instruction(instruction, &account_pubkeys)
+                else {
+                    continue;
+                };
+
+                let Some(AccountPurgatoryData {
+                    slot,
+                    account_data,
+                    owner,
+                    lamports,
+                }) = AccountPurgatory::release(purgatory, pda_mappings, pda, pda_source.clone())?
+                else {
+                    continue;
+                };
+
+                pda_source
+                    .evaluate_account_update(
+                        &account_data,
+                        subgraph_request,
+                        slot,
+                        pda,
+                        owner,
+                        lamports,
+                        entries,
+                    )
+                    .map_err(|e| {
+                        format!("Failed to evaluate account update for PDA {}: {}", pda, e)
+                    })?;
+            }
+        }
+        IndexedSubgraphSourceType::TokenAccount(token_account_source) => {
+            let mut already_found_token_accounts = vec![];
+            for instruction in transaction.message.instructions() {
+                token_account_source
+                    .evaluate_instruction(
+                        instruction,
+                        &account_pubkeys,
+                        data.transaction_status_meta,
+                        slot,
+                        *transaction.signatures.first().unwrap(),
+                        subgraph_request,
+                        &mut already_found_token_accounts,
+                        entries,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "Failed to evaluate instruction for token account source: {}",
+                            e
+                        )
+                    })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn probe_transaction_legacy(
+    purgatory: &Mutex<AccountPurgatory>,
+    pda_mappings: &Mutex<PdaMapping>,
+    subgraph_request: &SubgraphRequest,
     data: &ReplicaTransactionInfoV2<'_>,
     slot: Slot,
     entries: &mut Vec<HashMap<String, Value>>,
@@ -264,7 +390,8 @@ pub fn probe_transaction(
     }
 
     let transaction = data.transaction;
-    let account_keys = transaction.message().account_keys();
+    // FIXME: for versioned messages we have to handle also dynamic keys
+    let account_keys = transaction.message().static_account_keys();
     let account_pubkeys = account_keys.iter().cloned().collect::<Vec<_>>();
     let is_program_id_match = transaction.message().instructions().iter().any(|ix| {
         ix.program_id(account_pubkeys.as_ref())
@@ -285,7 +412,7 @@ pub fn probe_transaction(
                         inner_instructions,
                         subgraph_request,
                         slot,
-                        transaction.signature().clone(),
+                        *transaction.signature(),
                         entries,
                     )
                     .map_err(|e| {
@@ -337,7 +464,7 @@ pub fn probe_transaction(
                         &account_pubkeys,
                         data.transaction_status_meta,
                         slot,
-                        transaction.signature().clone(),
+                        *transaction.signature(),
                         subgraph_request,
                         &mut already_found_token_accounts,
                         entries,
@@ -376,7 +503,7 @@ impl PdaMapping {
         pda_mapping
             .lock()
             .map_err(|e| format!("Failed to lock PdaMapping: {}", e))
-            .and_then(|mapping| Ok(mapping._get(pubkey).cloned()))
+            .map(|mapping| mapping._get(pubkey).cloned())
     }
 }
 

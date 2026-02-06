@@ -20,11 +20,12 @@ reqwest = { workspace = true }
 rmcp = { workspace = true, features = ["transport-io", "transport-sse-server", "server", "schemars"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = "0.9"
 solana-keypair = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-signer = { workspace = true }
-spl-associated-token-account = { workspace = true }
-spl-token = { workspace = true }
+spl-associated-token-account-interface = { workspace = true }
+spl-token-interface = { workspace = true }
 tracing = { workspace = true }
 
 surfpool-core = { workspace = true }

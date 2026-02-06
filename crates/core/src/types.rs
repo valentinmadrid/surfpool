@@ -2,11 +2,17 @@ use std::{collections::HashSet, vec};
 
 use agave_reserved_account_keys::ReservedAccountKeys;
 use base64::{Engine, prelude::BASE64_STANDARD};
+use bytemuck::{Pod, bytes_of, from_bytes};
 use chrono::Utc;
 use litesvm::types::TransactionMetadata;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use solana_account::Account;
-use solana_account_decoder::parse_token::UiTokenAmount;
+use solana_account_decoder::{
+    parse_account_data::{AccountAdditionalDataV3, SplTokenAdditionalDataV2},
+    parse_token::UiTokenAmount,
+};
 use solana_clock::{Epoch, Slot};
+use solana_hash::Hash;
 use solana_message::{
     AccountKeys, VersionedMessage,
     v0::{LoadedAddresses, LoadedMessage, MessageAddressTableLookup},
@@ -18,9 +24,11 @@ use solana_transaction::{
     sanitized::SanitizedTransaction,
     versioned::{TransactionVersion, VersionedTransaction},
 };
+use solana_transaction_context::TransactionReturnData;
+use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
     Encodable, EncodableWithMeta, EncodeError, EncodedTransaction,
-    EncodedTransactionWithStatusMeta, InnerInstruction, InnerInstructions,
+    EncodedTransactionWithStatusMeta, InnerInstruction, InnerInstructions, Reward,
     TransactionBinaryEncoding, TransactionConfirmationStatus, TransactionStatus,
     TransactionStatusMeta, TransactionTokenBalance, UiAccountsList, UiLoadedAddresses,
     UiTransaction, UiTransactionEncoding, UiTransactionStatusMeta,
@@ -28,7 +36,10 @@ use solana_transaction_status::{
     parse_accounts::{parse_legacy_message_accounts, parse_v0_message_accounts},
     parse_ui_inner_instructions,
 };
-use spl_token_2022::extension::StateWithExtensions;
+use spl_token_2022_interface::extension::{
+    StateWithExtensions, interest_bearing_mint::InterestBearingConfig,
+    scaled_ui_amount::ScaledUiAmountConfig,
+};
 use txtx_addon_kit::indexmap::IndexMap;
 
 use crate::{
@@ -36,7 +47,212 @@ use crate::{
     surfnet::locker::{format_ui_amount, format_ui_amount_string},
 };
 
-#[derive(Debug, Clone)]
+/// Helper function to serialize a Pod type to base64
+fn serialize_pod_to_base64<T: Pod>(value: &T) -> String {
+    BASE64_STANDARD.encode(bytes_of(value))
+}
+
+/// Helper function to deserialize a Pod type from base64
+fn deserialize_pod_from_base64<T: Pod + Copy>(encoded: &str) -> Result<T, String> {
+    let bytes = BASE64_STANDARD
+        .decode(encoded)
+        .map_err(|e| format!("base64 decode error: {}", e))?;
+    if bytes.len() != std::mem::size_of::<T>() {
+        return Err(format!(
+            "Invalid byte length: expected {}, got {}",
+            std::mem::size_of::<T>(),
+            bytes.len()
+        ));
+    }
+    Ok(*from_bytes::<T>(&bytes))
+}
+
+/// Serializable version of SplTokenAdditionalDataV2
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializableSplTokenAdditionalData {
+    pub decimals: u8,
+    /// InterestBearingConfig serialized as base64, paired with unix timestamp
+    pub interest_bearing_config: Option<(String, i64)>,
+    /// ScaledUiAmountConfig serialized as base64, paired with unix timestamp
+    pub scaled_ui_amount_config: Option<(String, i64)>,
+}
+
+impl From<SplTokenAdditionalDataV2> for SerializableSplTokenAdditionalData {
+    fn from(data: SplTokenAdditionalDataV2) -> Self {
+        Self {
+            decimals: data.decimals,
+            interest_bearing_config: data
+                .interest_bearing_config
+                .map(|(config, ts)| (serialize_pod_to_base64(&config), ts)),
+            scaled_ui_amount_config: data
+                .scaled_ui_amount_config
+                .map(|(config, ts)| (serialize_pod_to_base64(&config), ts)),
+        }
+    }
+}
+
+impl TryFrom<SerializableSplTokenAdditionalData> for SplTokenAdditionalDataV2 {
+    type Error = String;
+
+    fn try_from(data: SerializableSplTokenAdditionalData) -> Result<Self, Self::Error> {
+        Ok(Self {
+            decimals: data.decimals,
+            interest_bearing_config: data
+                .interest_bearing_config
+                .map(|(encoded, ts)| {
+                    deserialize_pod_from_base64::<InterestBearingConfig>(&encoded)
+                        .map(|config| (config, ts))
+                })
+                .transpose()?,
+            scaled_ui_amount_config: data
+                .scaled_ui_amount_config
+                .map(|(encoded, ts)| {
+                    deserialize_pod_from_base64::<ScaledUiAmountConfig>(&encoded)
+                        .map(|config| (config, ts))
+                })
+                .transpose()?,
+        })
+    }
+}
+
+/// Serializable version of AccountAdditionalDataV3
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializableAccountAdditionalData {
+    pub spl_token_additional_data: Option<SerializableSplTokenAdditionalData>,
+}
+
+impl From<AccountAdditionalDataV3> for SerializableAccountAdditionalData {
+    fn from(data: AccountAdditionalDataV3) -> Self {
+        Self {
+            spl_token_additional_data: data.spl_token_additional_data.map(Into::into),
+        }
+    }
+}
+
+impl TryFrom<SerializableAccountAdditionalData> for AccountAdditionalDataV3 {
+    type Error = String;
+
+    fn try_from(data: SerializableAccountAdditionalData) -> Result<Self, Self::Error> {
+        Ok(Self {
+            spl_token_additional_data: data
+                .spl_token_additional_data
+                .map(TryInto::try_into)
+                .transpose()?,
+        })
+    }
+}
+
+/// Serializable version of TransactionTokenBalance
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializableTransactionTokenBalance {
+    pub account_index: u8,
+    pub mint: String,
+    pub ui_token_amount: UiTokenAmount,
+    pub owner: String,
+    pub program_id: String,
+}
+
+impl From<TransactionTokenBalance> for SerializableTransactionTokenBalance {
+    fn from(ttb: TransactionTokenBalance) -> Self {
+        Self {
+            account_index: ttb.account_index,
+            mint: ttb.mint,
+            ui_token_amount: ttb.ui_token_amount,
+            owner: ttb.owner,
+            program_id: ttb.program_id,
+        }
+    }
+}
+
+impl From<SerializableTransactionTokenBalance> for TransactionTokenBalance {
+    fn from(sttb: SerializableTransactionTokenBalance) -> Self {
+        Self {
+            account_index: sttb.account_index,
+            mint: sttb.mint,
+            ui_token_amount: sttb.ui_token_amount,
+            owner: sttb.owner,
+            program_id: sttb.program_id,
+        }
+    }
+}
+
+/// Serializable version of TransactionStatusMeta
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializableTransactionStatusMeta {
+    pub status: Result<(), TransactionError>,
+    pub fee: u64,
+    pub pre_balances: Vec<u64>,
+    pub post_balances: Vec<u64>,
+    pub inner_instructions: Option<Vec<InnerInstructions>>,
+    pub log_messages: Option<Vec<String>>,
+    pub pre_token_balances: Option<Vec<SerializableTransactionTokenBalance>>,
+    pub post_token_balances: Option<Vec<SerializableTransactionTokenBalance>>,
+    pub rewards: Option<Vec<Reward>>,
+    pub loaded_addresses: LoadedAddresses,
+    pub return_data: Option<TransactionReturnData>,
+    pub compute_units_consumed: Option<u64>,
+    pub cost_units: Option<u64>,
+}
+
+impl From<TransactionStatusMeta> for SerializableTransactionStatusMeta {
+    fn from(meta: TransactionStatusMeta) -> Self {
+        Self {
+            status: meta.status,
+            fee: meta.fee,
+            pre_balances: meta.pre_balances,
+            post_balances: meta.post_balances,
+            inner_instructions: meta.inner_instructions,
+            log_messages: meta.log_messages,
+            pre_token_balances: meta
+                .pre_token_balances
+                .map(|v| v.into_iter().map(Into::into).collect()),
+            post_token_balances: meta
+                .post_token_balances
+                .map(|v| v.into_iter().map(Into::into).collect()),
+            rewards: meta.rewards,
+            loaded_addresses: meta.loaded_addresses,
+            return_data: meta.return_data,
+            compute_units_consumed: meta.compute_units_consumed,
+            cost_units: meta.cost_units,
+        }
+    }
+}
+
+impl From<SerializableTransactionStatusMeta> for TransactionStatusMeta {
+    fn from(smeta: SerializableTransactionStatusMeta) -> Self {
+        Self {
+            status: smeta.status,
+            fee: smeta.fee,
+            pre_balances: smeta.pre_balances,
+            post_balances: smeta.post_balances,
+            inner_instructions: smeta.inner_instructions,
+            log_messages: smeta.log_messages,
+            pre_token_balances: smeta
+                .pre_token_balances
+                .map(|v| v.into_iter().map(Into::into).collect()),
+            post_token_balances: smeta
+                .post_token_balances
+                .map(|v| v.into_iter().map(Into::into).collect()),
+            rewards: smeta.rewards,
+            loaded_addresses: smeta.loaded_addresses,
+            return_data: smeta.return_data,
+            compute_units_consumed: smeta.compute_units_consumed,
+            cost_units: smeta.cost_units,
+        }
+    }
+}
+
+/// Helper struct for serializing TransactionWithStatusMeta
+/// Note: VersionedTransaction uses bincode internally, so we serialize it as base64-encoded bytes
+#[derive(Serialize, Deserialize)]
+struct SerializableTransactionWithStatusMeta {
+    pub slot: u64,
+    /// Base64-encoded bincode serialization of VersionedTransaction
+    pub transaction_bytes: String,
+    pub meta: SerializableTransactionStatusMeta,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum SurfnetTransactionStatus {
     Received,
     Processed(Box<(TransactionWithStatusMeta, HashSet<Pubkey>)>),
@@ -47,6 +263,13 @@ impl SurfnetTransactionStatus {
         match &self {
             SurfnetTransactionStatus::Received => unreachable!(),
             SurfnetTransactionStatus::Processed(data) => data,
+        }
+    }
+
+    pub fn as_processed(self) -> Option<(TransactionWithStatusMeta, HashSet<Pubkey>)> {
+        match self {
+            SurfnetTransactionStatus::Received => None,
+            SurfnetTransactionStatus::Processed(data) => Some(*data),
         }
     }
 
@@ -62,6 +285,47 @@ pub struct TransactionWithStatusMeta {
     pub meta: TransactionStatusMeta,
 }
 
+impl Serialize for TransactionWithStatusMeta {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Serialize VersionedTransaction using bincode, then base64 encode
+        let tx_bytes = bincode::serialize(&self.transaction)
+            .map_err(|e| serde::ser::Error::custom(format!("bincode error: {}", e)))?;
+        let tx_base64 = BASE64_STANDARD.encode(&tx_bytes);
+
+        let helper = SerializableTransactionWithStatusMeta {
+            slot: self.slot,
+            transaction_bytes: tx_base64,
+            meta: self.meta.clone().into(),
+        };
+        helper.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TransactionWithStatusMeta {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let helper = SerializableTransactionWithStatusMeta::deserialize(deserializer)?;
+
+        // Decode base64 and deserialize using bincode
+        let tx_bytes = BASE64_STANDARD
+            .decode(&helper.transaction_bytes)
+            .map_err(|e| serde::de::Error::custom(format!("base64 decode error: {}", e)))?;
+        let transaction: VersionedTransaction = bincode::deserialize(&tx_bytes)
+            .map_err(|e| serde::de::Error::custom(format!("bincode deserialize error: {}", e)))?;
+
+        Ok(Self {
+            slot: helper.slot,
+            transaction,
+            meta: helper.meta.into(),
+        })
+    }
+}
+
 impl TransactionWithStatusMeta {
     pub fn into_status(&self, current_slot: u64) -> TransactionStatus {
         TransactionStatus {
@@ -75,6 +339,8 @@ impl TransactionWithStatusMeta {
             confirmation_status: Some(TransactionConfirmationStatus::Finalized),
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         slot: u64,
         transaction: VersionedTransaction,
@@ -312,6 +578,8 @@ impl TransactionWithStatusMeta {
             }
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn from_failure(
         slot: u64,
         transaction: VersionedTransaction,
@@ -405,8 +673,8 @@ fn parse_ui_transaction_status_meta_with_account_keys(
 ) -> UiTransactionStatusMeta {
     let account_keys = AccountKeys::new(static_keys, Some(&meta.loaded_addresses));
     UiTransactionStatusMeta {
-        err: meta.status.clone().err(),
-        status: meta.status,
+        err: meta.status.clone().map_err(Into::into).err(),
+        status: meta.status.map_err(Into::into),
         fee: meta.fee,
         pre_balances: meta.pre_balances,
         post_balances: meta.post_balances,
@@ -437,10 +705,11 @@ fn parse_ui_transaction_status_meta_with_account_keys(
     }
 }
 
+// FIXME: use native transform from the solana official crate
 fn parse_ui_transaction_status_meta(meta: TransactionStatusMeta) -> UiTransactionStatusMeta {
     UiTransactionStatusMeta {
-        err: meta.status.clone().err(),
-        status: meta.status,
+        err: meta.status.clone().map_err(Into::into).err(),
+        status: meta.status.map_err(Into::into),
         fee: meta.fee,
         pre_balances: meta.pre_balances,
         post_balances: meta.post_balances,
@@ -472,8 +741,8 @@ fn build_simple_ui_transaction_status_meta(
     show_rewards: bool,
 ) -> UiTransactionStatusMeta {
     UiTransactionStatusMeta {
-        err: meta.status.clone().err(),
-        status: meta.status,
+        err: meta.status.clone().map_err(Into::into).err(),
+        status: meta.status.map_err(Into::into),
         fee: meta.fee,
         pre_balances: meta.pre_balances,
         post_balances: meta.post_balances,
@@ -508,6 +777,7 @@ pub fn surfpool_tx_metadata_to_litesvm_tx_metadata(
         return_data: metadata.return_data.clone(),
         inner_instructions: metadata.inner_instructions.clone(),
         signature: metadata.signature,
+        fee: metadata.fee,
     }
 }
 
@@ -557,27 +827,50 @@ impl<T> RemoteRpcResult<T> {
     }
 }
 
+/// Discriminant byte used for serializing token program variants.
+/// Ensures consistent encoding between TokenAccount and MintAccount.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenProgramDiscriminant {
+    SplToken = 0,
+    SplToken2022 = 1,
+}
+
+impl TokenProgramDiscriminant {
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::SplToken),
+            1 => Some(Self::SplToken2022),
+            _ => None,
+        }
+    }
+
+    pub fn as_byte(self) -> u8 {
+        self as u8
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum TokenAccount {
-    SplToken2022(spl_token_2022::state::Account),
-    SplToken(spl_token::state::Account),
+    SplToken2022(spl_token_2022_interface::state::Account),
+    SplToken(spl_token_interface::state::Account),
 }
 
 impl TokenAccount {
     pub fn token_program_id(&self) -> Pubkey {
         match self {
-            Self::SplToken2022(_) => spl_token_2022::id(),
-            Self::SplToken(_) => spl_token::id(),
+            Self::SplToken2022(_) => spl_token_2022_interface::id(),
+            Self::SplToken(_) => spl_token_interface::id(),
         }
     }
 
     pub fn unpack(bytes: &[u8]) -> SurfpoolResult<Self> {
-        if let Ok(account) = spl_token_2022::state::Account::unpack(bytes) {
+        if let Ok(account) = spl_token_2022_interface::state::Account::unpack(bytes) {
             Ok(Self::SplToken2022(account))
-        } else if let Ok(account) = spl_token::state::Account::unpack(bytes) {
+        } else if let Ok(account) = spl_token_interface::state::Account::unpack(bytes) {
             Ok(Self::SplToken(account))
         } else if let Ok(account) =
-            StateWithExtensions::<spl_token_2022::state::Account>::unpack(bytes)
+            StateWithExtensions::<spl_token_2022_interface::state::Account>::unpack(bytes)
         {
             Ok(Self::SplToken2022(account.base))
         } else {
@@ -585,19 +878,26 @@ impl TokenAccount {
         }
     }
 
-    pub fn new(token_program_id: &Pubkey, owner: Pubkey, mint: Pubkey) -> Self {
-        if token_program_id == &spl_token_2022::id() {
-            Self::SplToken2022(spl_token_2022::state::Account {
+    pub fn new(
+        token_program_id: &Pubkey,
+        owner: Pubkey,
+        mint: Pubkey,
+        is_native: Option<u64>,
+    ) -> Self {
+        if token_program_id == &spl_token_2022_interface::id() {
+            Self::SplToken2022(spl_token_2022_interface::state::Account {
                 mint,
                 owner,
-                state: spl_token_2022::state::AccountState::Initialized,
+                state: spl_token_2022_interface::state::AccountState::Initialized,
+                is_native: is_native.into(),
                 ..Default::default()
             })
         } else {
-            Self::SplToken(spl_token::state::Account {
+            Self::SplToken(spl_token_interface::state::Account {
                 mint,
                 owner,
-                state: spl_token::state::AccountState::Initialized,
+                state: spl_token_interface::state::AccountState::Initialized,
+                is_native: is_native.into(),
                 ..Default::default()
             })
         }
@@ -606,12 +906,12 @@ impl TokenAccount {
     pub fn pack_into_vec(&self) -> Vec<u8> {
         match self {
             Self::SplToken2022(account) => {
-                let mut dst = [0u8; spl_token_2022::state::Account::LEN];
+                let mut dst = [0u8; spl_token_2022_interface::state::Account::LEN];
                 account.pack_into_slice(&mut dst);
                 dst.to_vec()
             }
             Self::SplToken(account) => {
-                let mut dst = [0u8; spl_token::state::Account::LEN];
+                let mut dst = [0u8; spl_token_interface::state::Account::LEN];
                 account.pack_into_slice(&mut dst);
                 dst.to_vec()
             }
@@ -675,10 +975,10 @@ impl TokenAccount {
     }
 
     pub fn get_packed_len_for_token_program_id(token_program_id: &Pubkey) -> usize {
-        if *token_program_id == spl_token::id() {
-            spl_token::state::Account::get_packed_len()
+        if *token_program_id == spl_token_interface::id() {
+            spl_token_interface::state::Account::get_packed_len()
         } else {
-            spl_token_2022::state::Account::get_packed_len()
+            spl_token_2022_interface::state::Account::get_packed_len()
         }
     }
 
@@ -686,25 +986,21 @@ impl TokenAccount {
         match self {
             Self::SplToken2022(account) => {
                 account.state = match state {
-                    "uninitialized" => spl_token_2022::state::AccountState::Uninitialized,
-                    "frozen" => spl_token_2022::state::AccountState::Frozen,
-                    "initialized" => spl_token_2022::state::AccountState::Initialized,
+                    "uninitialized" => spl_token_2022_interface::state::AccountState::Uninitialized,
+                    "frozen" => spl_token_2022_interface::state::AccountState::Frozen,
+                    "initialized" => spl_token_2022_interface::state::AccountState::Initialized,
                     _ => {
-                        return Err(SurfpoolError::invalid_token_account_state(
-                            &state.to_string(),
-                        ));
+                        return Err(SurfpoolError::invalid_token_account_state(state));
                     }
                 }
             }
             Self::SplToken(account) => {
                 account.state = match state {
-                    "uninitialized" => spl_token::state::AccountState::Uninitialized,
-                    "frozen" => spl_token::state::AccountState::Frozen,
-                    "initialized" => spl_token::state::AccountState::Initialized,
+                    "uninitialized" => spl_token_interface::state::AccountState::Uninitialized,
+                    "frozen" => spl_token_interface::state::AccountState::Frozen,
+                    "initialized" => spl_token_interface::state::AccountState::Initialized,
                     _ => {
-                        return Err(SurfpoolError::invalid_token_account_state(
-                            &state.to_string(),
-                        ));
+                        return Err(SurfpoolError::invalid_token_account_state(state));
                     }
                 }
             }
@@ -713,19 +1009,139 @@ impl TokenAccount {
     }
 }
 
+impl Serialize for TokenAccount {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut bytes = Vec::with_capacity(1 + spl_token_2022_interface::state::Account::LEN);
+        match self {
+            Self::SplToken2022(account) => {
+                bytes.push(TokenProgramDiscriminant::SplToken2022.as_byte());
+                let mut dst = [0u8; spl_token_2022_interface::state::Account::LEN];
+                account.pack_into_slice(&mut dst);
+                bytes.extend_from_slice(&dst);
+            }
+            Self::SplToken(account) => {
+                bytes.push(TokenProgramDiscriminant::SplToken.as_byte());
+                let mut dst = [0u8; spl_token_interface::state::Account::LEN];
+                account.pack_into_slice(&mut dst);
+                bytes.extend_from_slice(&dst);
+            }
+        }
+        let encoded = BASE64_STANDARD.encode(&bytes);
+        serializer.serialize_str(&encoded)
+    }
+}
+
+impl<'de> Deserialize<'de> for TokenAccount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        let bytes = BASE64_STANDARD
+            .decode(&encoded)
+            .map_err(serde::de::Error::custom)?;
+
+        if bytes.is_empty() {
+            return Err(serde::de::Error::custom("Empty TokenAccount bytes"));
+        }
+
+        let discriminant = TokenProgramDiscriminant::from_byte(bytes[0]).ok_or_else(|| {
+            serde::de::Error::custom(format!("Unknown TokenAccount discriminant: {}", bytes[0]))
+        })?;
+        let data = &bytes[1..];
+
+        match discriminant {
+            TokenProgramDiscriminant::SplToken2022 => {
+                let account = spl_token_2022_interface::state::Account::unpack(data)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(TokenAccount::SplToken2022(account))
+            }
+            TokenProgramDiscriminant::SplToken => {
+                let account = spl_token_interface::state::Account::unpack(data)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(TokenAccount::SplToken(account))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum MintAccount {
-    SplToken2022(spl_token_2022::state::Mint),
-    SplToken(spl_token::state::Mint),
+    SplToken2022(spl_token_2022_interface::state::Mint),
+    SplToken(spl_token_interface::state::Mint),
+}
+
+impl Serialize for MintAccount {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut bytes = Vec::with_capacity(1 + spl_token_2022_interface::state::Mint::LEN);
+        match self {
+            Self::SplToken2022(mint) => {
+                bytes.push(TokenProgramDiscriminant::SplToken2022.as_byte());
+                let mut dst = [0u8; spl_token_2022_interface::state::Mint::LEN];
+                mint.pack_into_slice(&mut dst);
+                bytes.extend_from_slice(&dst);
+            }
+            Self::SplToken(mint) => {
+                bytes.push(TokenProgramDiscriminant::SplToken.as_byte());
+                let mut dst = [0u8; spl_token_interface::state::Mint::LEN];
+                mint.pack_into_slice(&mut dst);
+                bytes.extend_from_slice(&dst);
+            }
+        }
+        let encoded = BASE64_STANDARD.encode(&bytes);
+        serializer.serialize_str(&encoded)
+    }
+}
+
+impl<'de> Deserialize<'de> for MintAccount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        let bytes = BASE64_STANDARD
+            .decode(&encoded)
+            .map_err(serde::de::Error::custom)?;
+
+        if bytes.is_empty() {
+            return Err(serde::de::Error::custom("Empty MintAccount bytes"));
+        }
+
+        let discriminant = TokenProgramDiscriminant::from_byte(bytes[0]).ok_or_else(|| {
+            serde::de::Error::custom(format!("Unknown MintAccount discriminant: {}", bytes[0]))
+        })?;
+        let data = &bytes[1..];
+
+        match discriminant {
+            TokenProgramDiscriminant::SplToken2022 => {
+                let mint = spl_token_2022_interface::state::Mint::unpack(data)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(MintAccount::SplToken2022(mint))
+            }
+            TokenProgramDiscriminant::SplToken => {
+                let mint = spl_token_interface::state::Mint::unpack(data)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(MintAccount::SplToken(mint))
+            }
+        }
+    }
 }
 
 impl MintAccount {
     pub fn unpack(bytes: &[u8]) -> SurfpoolResult<Self> {
-        if let Ok(mint) = StateWithExtensions::<spl_token_2022::state::Mint>::unpack(&bytes) {
+        if let Ok(mint) =
+            StateWithExtensions::<spl_token_2022_interface::state::Mint>::unpack(bytes)
+        {
             Ok(Self::SplToken2022(mint.base))
-        } else if let Ok(mint) = spl_token_2022::state::Mint::unpack(bytes) {
+        } else if let Ok(mint) = spl_token_2022_interface::state::Mint::unpack(bytes) {
             Ok(Self::SplToken2022(mint))
-        } else if let Ok(mint) = spl_token::state::Mint::unpack(bytes) {
+        } else if let Ok(mint) = spl_token_interface::state::Mint::unpack(bytes) {
             Ok(Self::SplToken(mint))
         } else {
             Err(SurfpoolError::unpack_mint_account())
@@ -765,6 +1181,16 @@ impl GeyserAccountUpdate {
     }
 
     pub fn block_update(pubkey: Pubkey, account: Account, slot: u64, write_version: u64) -> Self {
+        Self {
+            pubkey,
+            account,
+            slot,
+            sanitized_transaction: None,
+            write_version,
+        }
+    }
+
+    pub fn startup_update(pubkey: Pubkey, account: Account, slot: u64, write_version: u64) -> Self {
         Self {
             pubkey,
             account,
@@ -961,5 +1387,42 @@ impl TransactionLoadedAddresses {
             .values()
             .map(|loaded_addresses| loaded_addresses.readonly.len())
             .sum()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SyntheticBlockhash(Hash);
+impl SyntheticBlockhash {
+    pub const PREFIX: &str = "SURFNETxSAFEHASHx";
+    pub fn new(chain_tip_index: u64) -> Self {
+        // Create a new synthetic blockhash - SURFNETxSAFEHASHxxxxxxxxxxxxxxxxxxxxxxxxx28
+        // Create a string and decode it from base58 to get the raw bytes
+        let index_hex = format!("{:08x}", chain_tip_index)
+            .replace('0', "x") // Replace 0 with x
+            .replace('O', "x"); // Replace O with x
+
+        // Calculate how many 'x' characters we need to pad to reach a consistent length
+        let target_length = 43; // 43 base58 sequence leads us to 32 bytes
+        let padding_needed = target_length - SyntheticBlockhash::PREFIX.len() - index_hex.len();
+        let padding = "x".repeat(padding_needed.max(0));
+        let target_string = format!("{}{}{}", SyntheticBlockhash::PREFIX, padding, index_hex);
+
+        let decoded_bytes = bs58::decode(&target_string).into_vec().unwrap_or_else(|_| {
+            // Fallback if decode fails
+            vec![0u8; 32]
+        });
+
+        let mut blockhash_bytes = [0u8; 32];
+        blockhash_bytes[..decoded_bytes.len().min(32)]
+            .copy_from_slice(&decoded_bytes[..decoded_bytes.len().min(32)]);
+        Self(Hash::new_from_array(blockhash_bytes))
+    }
+
+    pub fn to_string(&self) -> String {
+        self.0.to_string()
+    }
+
+    pub fn hash(&self) -> &Hash {
+        &self.0
     }
 }

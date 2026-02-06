@@ -67,6 +67,7 @@ pub trait Dataloader {
         request: &SubgraphRequest,
         worker_id: &Uuid,
     ) -> Result<(), String>;
+    fn unregister_collection(&self, uuid: &Uuid) -> Result<(), String>;
     fn insert_entries_into_collection(
         &self,
         entries: Vec<CollectionEntryData>,
@@ -164,6 +165,10 @@ impl CollectionsMetadataLookup {
     pub fn add_collection(&mut self, entry: CollectionMetadata) {
         self.entries.insert(entry.name.to_case(Case::Camel), entry);
     }
+
+    pub fn remove_collection(&mut self, uuid: &Uuid) {
+        self.entries.retain(|_, metadata| metadata.id != *uuid);
+    }
 }
 
 #[derive(MultiConnection)]
@@ -246,15 +251,14 @@ pub fn extract_graphql_features<'a>(
                             match value.item {
                                 juniper::LookAheadValue::Object(obj) => {
                                     for (predicate, predicate_value) in obj.iter() {
-                                        match predicate_value.item {
-                                            juniper::LookAheadValue::Scalar(value) => {
-                                                filters_specs.push((
-                                                    attribute.item,
-                                                    predicate.item,
-                                                    value,
-                                                ));
-                                            }
-                                            _ => {}
+                                        if let juniper::LookAheadValue::Scalar(value) =
+                                            predicate_value.item
+                                        {
+                                            filters_specs.push((
+                                                attribute.item,
+                                                predicate.item,
+                                                value,
+                                            ));
                                         }
                                     }
                                 }

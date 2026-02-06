@@ -2,12 +2,15 @@ use std::{fmt::Display, future::Future, pin::Pin};
 
 use crossbeam_channel::TrySendError;
 use jsonrpc_core::{Error, Result};
+use litesvm::error::LiteSVMError;
 use serde::Serialize;
 use serde_json::json;
 use solana_client::{client_error::ClientError, rpc_request::TokenAccountsFilter};
 use solana_clock::Slot;
 use solana_pubkey::Pubkey;
 use solana_transaction_status::EncodeError;
+
+use crate::storage::StorageError;
 
 pub type SurfpoolResult<T> = std::result::Result<T, SurfpoolError>;
 
@@ -154,9 +157,9 @@ impl SurfpoolError {
 
         let filter_description = match filter {
             TokenAccountsFilter::ProgramId(program_id) => {
-                let program_name = if *program_id == spl_token::ID {
+                let program_name = if *program_id == spl_token_interface::ID {
                     "SPL Token program"
-                } else if *program_id == spl_token_2022::ID {
+                } else if *program_id == spl_token_2022_interface::ID {
                     "Token 2022 program"
                 } else {
                     "custom token program"
@@ -181,8 +184,8 @@ impl SurfpoolError {
         error.data = Some(json!(format!(
             "Unsupported token program: {}. Only SPL Token ({}) and Token 2022 ({}) are currently supported.",
             program_id,
-            spl_token::ID,
-            spl_token_2022::ID
+            spl_token_interface::ID,
+            spl_token_2022_interface::ID
         )));
         Self(error)
     }
@@ -280,6 +283,17 @@ impl SurfpoolError {
         D: Serialize,
     {
         let mut error = Error::invalid_params(format!("Invalid program account {program_id}"));
+        error.data = Some(json!(data));
+        Self(error)
+    }
+
+    pub fn invalid_program_data_account<P, D>(program_data_id: P, data: D) -> Self
+    where
+        P: Display,
+        D: Serialize,
+    {
+        let mut error =
+            Error::invalid_params(format!("Invalid program data account {program_data_id}"));
         error.data = Some(json!(data));
         Self(error)
     }
@@ -434,5 +448,21 @@ impl SurfpoolError {
         let mut error = Error::internal_error();
         error.message = format!("Expected profile not found for key {key}");
         Self(error)
+    }
+}
+
+impl From<StorageError> for SurfpoolError {
+    fn from(e: StorageError) -> Self {
+        let mut error = Error::internal_error();
+        error.data = Some(json!(format!("Storage error: {}", e.to_string())));
+        SurfpoolError(error)
+    }
+}
+
+impl From<LiteSVMError> for SurfpoolError {
+    fn from(e: LiteSVMError) -> Self {
+        let mut error = Error::internal_error();
+        error.data = Some(json!(format!("LiteSVM error: {}", e.to_string())));
+        SurfpoolError(error)
     }
 }

@@ -18,11 +18,9 @@ use solana_rpc_client_api::response::Response as RpcResponse;
 
 use super::{RunloopContext, SurfnetRpcContext};
 use crate::{
+    SURFPOOL_IDENTITY_PUBKEY,
     rpc::{State, utils::verify_pubkey},
-    surfnet::{
-        FINALIZATION_SLOT_THRESHOLD, GetAccountResult, SURFPOOL_IDENTITY_PUBKEY,
-        locker::SvmAccessContext,
-    },
+    surfnet::{FINALIZATION_SLOT_THRESHOLD, GetAccountResult, locker::SvmAccessContext},
 };
 
 const SURFPOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -695,9 +693,8 @@ impl Minimal for SurfpoolMinimalRpc {
         let config = config.unwrap_or_default();
 
         if let Some(target_slot) = config.min_context_slot {
-            let block_exists = meta
-                .with_svm_reader(|svm_reader| svm_reader.blocks.contains_key(&target_slot))
-                .map_err(Into::<jsonrpc_core::Error>::into)?;
+            let block_exists =
+                meta.with_svm_reader(|svm_reader| svm_reader.blocks.contains_key(&target_slot))??;
 
             if !block_exists {
                 return Err(jsonrpc_core::Error::invalid_params(format!(
@@ -709,22 +706,23 @@ impl Minimal for SurfpoolMinimalRpc {
 
         meta.with_svm_reader(|svm_reader| {
             if let Some(target_slot) = config.min_context_slot {
-                if let Some(block_header) = svm_reader.blocks.get(&target_slot) {
-                    return block_header.block_height;
+                if let Some(block_header) = svm_reader.blocks.get(&target_slot)? {
+                    return Ok(block_header.block_height);
                 }
             }
 
             // default behavior: return the latest block height with commitment adjustments
             let latest_block_height = svm_reader.latest_epoch_info.block_height;
 
-            match config.commitment.unwrap_or_default().commitment {
+            let block_height = match config.commitment.unwrap_or_default().commitment {
                 CommitmentLevel::Processed => latest_block_height,
                 CommitmentLevel::Confirmed => latest_block_height.saturating_sub(1),
                 CommitmentLevel::Finalized => {
                     latest_block_height.saturating_sub(FINALIZATION_SLOT_THRESHOLD)
                 }
-            }
-        })
+            };
+            Ok::<u64, jsonrpc_core::Error>(block_height)
+        })?
         .map_err(Into::into)
     }
 
@@ -817,7 +815,7 @@ mod tests {
     use solana_pubkey::Pubkey;
 
     use super::*;
-    use crate::tests::helpers::TestSetup;
+    use crate::{tests::helpers::TestSetup, types::SyntheticBlockhash};
 
     #[test]
     fn test_get_block_height_processed_commitment() {
@@ -873,17 +871,20 @@ mod tests {
         {
             let mut svm_writer = setup.context.svm_locker.0.blocking_write();
             for (slot, block_height) in &test_cases {
-                svm_writer.blocks.insert(
-                    *slot,
-                    crate::surfnet::BlockHeader {
-                        hash: format!("hash_{}", slot),
-                        previous_blockhash: format!("prev_hash_{}", slot - 1),
-                        block_time: chrono::Utc::now().timestamp_millis(),
-                        block_height: *block_height,
-                        parent_slot: slot - 1,
-                        signatures: Vec::new(),
-                    },
-                );
+                svm_writer
+                    .blocks
+                    .store(
+                        *slot,
+                        crate::surfnet::BlockHeader {
+                            hash: SyntheticBlockhash::new(*slot).to_string(),
+                            previous_blockhash: SyntheticBlockhash::new(slot - 1).to_string(),
+                            block_time: chrono::Utc::now().timestamp_millis(),
+                            block_height: *block_height,
+                            parent_slot: slot - 1,
+                            signatures: Vec::new(),
+                        },
+                    )
+                    .unwrap();
             }
         }
 
@@ -916,17 +917,20 @@ mod tests {
 
         {
             let mut svm_writer = setup.context.svm_locker.0.blocking_write();
-            svm_writer.blocks.insert(
-                100,
-                crate::surfnet::BlockHeader {
-                    hash: "hash_100".to_string(),
-                    previous_blockhash: "prev_hash_99".to_string(),
-                    block_time: chrono::Utc::now().timestamp_millis(),
-                    block_height: 50,
-                    parent_slot: 99,
-                    signatures: Vec::new(),
-                },
-            );
+            svm_writer
+                .blocks
+                .store(
+                    100,
+                    crate::surfnet::BlockHeader {
+                        hash: SyntheticBlockhash::new(100).to_string(),
+                        previous_blockhash: SyntheticBlockhash::new(99).to_string(),
+                        block_time: chrono::Utc::now().timestamp_millis(),
+                        block_height: 50,
+                        parent_slot: 99,
+                        signatures: Vec::new(),
+                    },
+                )
+                .unwrap();
         }
 
         // slot that definitely doesn't exist
